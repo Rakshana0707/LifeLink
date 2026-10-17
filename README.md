@@ -260,24 +260,35 @@ npm install
 # 2. Install client dependencies
 npm install --prefix client
 
-# 3. Configure environment (see §11)
-cp .env.example .env
-# then edit .env — at minimum, set a SESSION_SECRET (see below)
+# 3. (Optional) Set up Python AI microservice (NLP & Chatbot)
+cd backend
+python -m venv venv
+# Windows:
+.\venv\Scripts\activate
+# Linux/macOS:
+# source venv/bin/activate
+pip install -r requirements.txt
+cd ..
 
-# 4. Create the database and seed demo data (see §12)
+# 4. Configure environment (see §11)
+cp .env.example .env
+# Edit .env with your session secrets or Firebase credentials
+
+# 5. Create the database and seed demo data (see §12)
 npm run setup
 
-# 5. Run both the API server and the Vite dev client together
+# 6. Run both the API server and the Vite dev client together
 npm run dev
 ```
 
 - Client (Vite dev server): http://localhost:5173
 - API (Express): http://localhost:8000
+- AI Microservice (FastAPI): http://localhost:8001
 
 For a production-style single-process run instead:
 ```bash
 npm run build     # builds client/dist
-npm start         # Express serves the API AND the built client on one port
+npm start         # runs cross-platform launcher (Express + FastAPI)
 ```
 
 Run the automated test suite (backend service/unit tests):
