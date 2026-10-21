@@ -10,6 +10,7 @@ const { sendEmail } = require('./mailer');
 const { rankDonorsForRequest, DEFAULT_WEIGHTS, MATCHING_STRATEGY } = require('./matching');
 const notificationService = require('./services/notifications');
 const { getActorFromRequest, admin } = require('./firebase_auth');
+const { createSessionToken } = require('./auth');
 const { rateLimit } = require('./rateLimit');
 const { ensureAuditTable, makeAuditLogger } = require('./audit');
 
@@ -282,7 +283,8 @@ const buildUserResponse = (u) => {
     lat: null,
     lng: null,
     telegramChatId: null,
-    phone: null
+    phone: null,
+    email: u.email || null
   };
 };
 
@@ -297,9 +299,9 @@ const withPrivateFieldsIfAuthorized = (publicUser, rawUser, viewerActor) => {
   return { ...publicUser, lat: rawUser.lat, lng: rawUser.lng, telegramChatId: rawUser.telegram_chat_id, phone: rawUser.phone };
 };
 
-app.get('/api/users', (req, res) => {
+app.get('/api/users', async (req, res) => {
   try {
-    const viewer = getActorFromRequest(req); // optional — anonymous browsing is allowed, but gets sanitized rows
+    const viewer = await getActorFromRequest(req, db); // optional — anonymous browsing is allowed, but gets sanitized rows
     const rows = db.prepare('SELECT * FROM users').all();
     res.json(rows.map((u) => withPrivateFieldsIfAuthorized(buildUserResponse(u), u, viewer)));
   } catch (err) {
@@ -307,9 +309,20 @@ app.get('/api/users', (req, res) => {
   }
 });
 
+app.get('/api/users/:id', async (req, res) => {
+  try {
+    const viewer = await getActorFromRequest(req, db);
+    const row = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
+    if (!row) return res.status(404).json({ error: 'User not found' });
+    res.json(withPrivateFieldsIfAuthorized(buildUserResponse(row), row, viewer));
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
 app.post('/api/users', rateLimit('register', 20, 3600000), (req, res) => {
   try {
-    const { name, role, bloodType, location, status, isNewRegistration, password, lat, lng, telegramChatId, licenseNumber, accreditationDoc, phone } = req.body;
+    const { name, role, bloodType, location, status, isNewRegistration, password, lat, lng, telegramChatId, licenseNumber, accreditationDoc, phone, email } = req.body;
 
     // telegramChatId is no longer required with Firebase Auth
     if (!name || !role) {
@@ -332,7 +345,7 @@ app.post('/api/users', rateLimit('register', 20, 3600000), (req, res) => {
       `INSERT INTO users (id, name, email, phone, role, password_hash, telegram_chat_id, passport_id,
                            status, is_new_registration, total_donations, xp, location_id, lat, lng)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(id, name, null, phone || null, role, passwordHash, telegramChatId, passportId, finalStatus, newReg, initialDonations, initialXP, locationId, lat ?? null, lng ?? null);
+    ).run(id, name, email || null, phone || null, role, passwordHash, telegramChatId, passportId, finalStatus, newReg, initialDonations, initialXP, locationId, lat ?? null, lng ?? null);
 
     if (role === 'Donor') {
       const groupId = groupIdByType[bloodType] || groupIdByType['O+'];
@@ -491,7 +504,7 @@ const findUserByLogin = (username) => {
   const rows = db.prepare('SELECT * FROM users').all();
   return rows.find((u) => {
     const emailSim = u.name.toLowerCase().replace(/\s+/g, '') + '@email.com';
-    return u.name.toLowerCase() === nameLower || emailSim === nameLower;
+    return u.name.toLowerCase() === nameLower || (u.email && u.email.toLowerCase() === nameLower) || emailSim === nameLower || u.id.toLowerCase() === nameLower;
   });
 };
 
@@ -734,7 +747,7 @@ app.post('/api/emergencies', rateLimit('emergency-create', 20, 60000), (req, res
     // If the caller is authenticated as a Hospital, don't let them file the request under a
     // different hospital's name (identity spoofing) — otherwise trust the free-text hospital
     // field, since anonymous/community-reported requests don't have an account to bind to.
-    const actor = getActorFromRequest(req);
+    const actor = await getActorFromRequest(req, db);
     const effectiveHospital = actor && actor.role === 'Hospital' ? actor.name : hospital;
     const groupIdVal = groupIdByType[bloodType];
     if (!groupIdVal) return res.status(400).json({ error: `Unknown blood type: ${bloodType}` });

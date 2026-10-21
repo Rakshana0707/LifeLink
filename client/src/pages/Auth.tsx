@@ -64,8 +64,16 @@ export const Auth: React.FC = () => {
 
     setLoading(true);
     try {
-      await signup(pendingUser);
-      navigateTo('home');
+      const newUser = await signup(pendingUser);
+      const targetPage: Page =
+        newUser.role === 'Donor'
+          ? 'donor-dash'
+          : newUser.role === 'Hospital'
+          ? 'hospital'
+          : newUser.role === 'Blood Bank'
+          ? 'bloodbank'
+          : 'home';
+      navigateTo(targetPage);
     } catch (err: any) {
       // Toast shown in context
     } finally {

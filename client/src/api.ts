@@ -495,6 +495,9 @@ export const api = {
   // Users APIs
   getUsers: (): Promise<User[]> => 
     authedFetch('/api/users').then(handleResponse),
+
+  getUserById: (id: string): Promise<User> =>
+    authedFetch(`/api/users/${id}`).then(handleResponse),
   
   createUser: (userData: Partial<User> & { password?: string }): Promise<User> =>
     authedFetch('/api/users', {

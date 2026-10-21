@@ -73,14 +73,30 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const login = async (email: string, password: string): Promise<User> => {
     try {
-      const fbCred = await signInWithEmailAndPassword(auth, email, password);
-      const token = await fbCred.user.getIdToken();
-      setApiActor(token);
+      let loggedUser: User | null = null;
+      try {
+        const fbCred = await signInWithEmailAndPassword(auth, email, password);
+        const token = await fbCred.user.getIdToken();
+        setApiActor(token);
 
-      // Fetch our SQLite user record
-      const list = await api.getUsers();
-      const loggedUser = list.find(u => u.id === fbCred.user.uid);
-      if (!loggedUser) throw new Error("User record not found in database.");
+        try {
+          loggedUser = await api.getUserById(fbCred.user.uid);
+        } catch {
+          const list = await api.getUsers();
+          loggedUser = list.find((u) => u.id === fbCred.user.uid) || null;
+        }
+      } catch (fbErr: any) {
+        // Fallback for demo/admin accounts in SQLite
+        try {
+          const res = await api.login(email, password);
+          loggedUser = res;
+          setApiActor(res.token);
+        } catch {
+          throw fbErr;
+        }
+      }
+
+      if (!loggedUser) throw new Error('User record not found in database.');
 
       setUser(loggedUser);
       localStorage.setItem('lifelink_user', JSON.stringify(loggedUser));
