@@ -362,13 +362,14 @@ export const Auth: React.FC = () => {
                 <div className="auth-sub">Enter your account credentials to access your dashboard</div>
                 
                 <div className="form-group">
-                  <label className="form-label">Email</label>
+                  <label className="form-label">Email or Username</label>
                   <input 
                     className="form-input" 
-                    type="email"
-                    placeholder="arjun@email.com" 
+                    type="text"
+                    placeholder="arjun@email.com or Platform Admin" 
                     value={loginEmail}
                     onChange={(e) => setLoginEmail(e.target.value)}
+                    autoComplete="username"
                   />
                 </div>
                 <div className="form-group">
@@ -379,6 +380,7 @@ export const Auth: React.FC = () => {
                     placeholder="••••••••" 
                     value={loginPassword}
                     onChange={(e) => setLoginPassword(e.target.value)}
+                    autoComplete="current-password"
                   />
                 </div>
                 

@@ -436,8 +436,19 @@ const handleResponse = async (res: Response) => {
 // replaces the previous scheme of sending a raw, client-editable actor id/role header,
 // which the server trusted with no proof of authentication.
 let _sessionToken: string | null = null;
+try {
+  _sessionToken = localStorage.getItem('lifelink_token');
+} catch {}
+
 export const setApiActor = (token: string | null) => {
   _sessionToken = token;
+  try {
+    if (token) {
+      localStorage.setItem('lifelink_token', token);
+    } else {
+      localStorage.removeItem('lifelink_token');
+    }
+  } catch {}
 };
 const authHeaders = (): Record<string, string> => ({
   'Content-Type': 'application/json',

@@ -17,6 +17,33 @@ interface AuthContextType {
   reloadUsersList: () => Promise<void>;
 }
 
+// Helper to format auth errors into clean, user-friendly messages
+const getFriendlyErrorMessage = (err: any): string => {
+  const code = err?.code || '';
+  switch (code) {
+    case 'auth/email-already-in-use':
+      return 'An account with this email already exists. Please sign in instead.';
+    case 'auth/invalid-email':
+      return 'The email address format is invalid.';
+    case 'auth/weak-password':
+      return 'Password should be at least 6 characters.';
+    case 'auth/user-not-found':
+    case 'auth/wrong-password':
+    case 'auth/invalid-credential':
+      return 'Invalid email or password. Please check your credentials.';
+    case 'auth/too-many-requests':
+      return 'Too many attempts. Please wait a moment and try again.';
+    case 'auth/popup-closed-by-user':
+      return 'Google sign-in popup was closed before completing.';
+    case 'auth/popup-blocked':
+      return 'Sign-in popup was blocked by your browser. Please allow popups.';
+    case 'auth/network-request-failed':
+      return 'Network error. Please check your internet connection.';
+    default:
+      return err?.message?.replace(/^Firebase:\s*/, '') || 'Authentication failed.';
+  }
+};
+
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
@@ -103,8 +130,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       showToast('success', '✅ Welcome Back', `Logged in as ${loggedUser.name}`);
       return loggedUser;
     } catch (err: any) {
-      showToast('warning', '❌ Sign In Failed', err.message || 'Invalid email or password');
-      throw err;
+      const friendlyMsg = getFriendlyErrorMessage(err);
+      showToast('warning', '❌ Sign In Failed', friendlyMsg);
+      throw new Error(friendlyMsg);
     }
   };
 
@@ -133,8 +161,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       await reloadUsersList();
       return newUser;
     } catch (err: any) {
-      showToast('warning', '❌ Registration Failed', err.message || 'Could not register user');
-      throw err;
+      const friendlyMsg = getFriendlyErrorMessage(err);
+      showToast('warning', '❌ Registration Failed', friendlyMsg);
+      throw new Error(friendlyMsg);
     }
   };
 
@@ -170,8 +199,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       await reloadUsersList();
       return sqlUser;
     } catch (err: any) {
-      showToast('warning', '❌ Google Sign-In Failed', err.message || 'Could not sign in with Google');
-      throw err;
+      const friendlyMsg = getFriendlyErrorMessage(err);
+      showToast('warning', '❌ Google Sign-In Failed', friendlyMsg);
+      throw new Error(friendlyMsg);
     }
   };
 
