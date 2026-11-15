@@ -59,23 +59,24 @@ const PRIVATE_PAGES: Page[] = ['donor-dash', 'hospital', 'bloodbank', 'dashboard
 
 const AppContent: React.FC = () => {
   const { page, navigateTo } = useRouting();
-  const { isLoggedIn } = useAuth();
+  const { isLoggedIn, loading } = useAuth();
   const { showToast } = useToast();
   const warnedRef = useRef<Page | null>(null);
 
-  const isGated = PRIVATE_PAGES.includes(page) && !isLoggedIn;
+  const isGated = !loading && PRIVATE_PAGES.includes(page) && !isLoggedIn;
 
   useEffect(() => {
-    if (isGated && warnedRef.current !== page) {
+    if (!loading && isGated && warnedRef.current !== page) {
       warnedRef.current = page;
       showToast('warning', '🔒 Members Only', 'Sign in or register to unlock your personal dashboard.');
       navigateTo('auth');
     }
     if (!isGated) warnedRef.current = null;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page, isLoggedIn]);
+  }, [page, isLoggedIn, loading]);
 
   const renderPage = () => {
+    if (loading) return <PageLoading />;
     if (isGated) return <Auth />;
 
     switch (page) {

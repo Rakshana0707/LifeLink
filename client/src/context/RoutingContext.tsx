@@ -28,12 +28,21 @@ interface RoutingContextType {
 const RoutingContext = createContext<RoutingContextType | undefined>(undefined);
 
 export const RoutingProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [page, setPage] = useState<Page>('home');
+  const [page, setPage] = useState<Page>(() => {
+    try {
+      const saved = sessionStorage.getItem('lifelink_current_page') as Page;
+      if (saved) return saved;
+    } catch {}
+    return 'home';
+  });
   const [routeState, setRouteState] = useState<any>(null);
 
   const navigateTo = (target: Page, state: any = null) => {
     setRouteState(state);
     setPage(target);
+    try {
+      sessionStorage.setItem('lifelink_current_page', target);
+    } catch {}
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 

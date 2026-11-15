@@ -28,6 +28,7 @@ export const Auth: React.FC = () => {
   const [licenseNumber, setLicenseNumber] = useState('');
   const [uploadedFile, setUploadedFile] = useState<File | null>(null);
   const [registerPassword, setRegisterPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
 
   // Login Fields
   const [loginEmail, setLoginEmail] = useState('');
@@ -39,19 +40,40 @@ export const Auth: React.FC = () => {
 
   const handleSignupSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!firstName || !email || !registerPassword) {
+    if (loading) return;
+
+    const trimmedFirst = firstName.trim();
+    const trimmedEmail = email.trim();
+
+    if (!trimmedFirst || !trimmedEmail || !registerPassword) {
       showToast('warning', '⚠️ Missing Info', 'Please fill in all required fields.');
       return;
     }
 
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(trimmedEmail)) {
+      showToast('warning', '⚠️ Invalid Email', 'Please enter a valid email address.');
+      return;
+    }
+
+    if (registerPassword.length < 6) {
+      showToast('warning', '⚠️ Weak Password', 'Password must be at least 6 characters.');
+      return;
+    }
+
+    if (registerPassword !== confirmPassword) {
+      showToast('warning', '⚠️ Password Mismatch', 'Passwords do not match. Please re-enter.');
+      return;
+    }
+
     const finalRole = selectedRole === 'Patient' ? 'Donor' : selectedRole;
-    const fullName = finalRole === 'Donor' ? `${firstName} ${lastName}`.trim() : firstName.trim();
+    const fullName = finalRole === 'Donor' ? `${trimmedFirst} ${lastName.trim()}`.trim() : trimmedFirst;
     const finalBloodType = finalRole === 'Donor' ? (bloodGroup || 'O+') : 'Multiple';
     const finalCity = city.trim() || 'Coimbatore';
 
     const pendingUser = {
       name: fullName,
-      email: email.trim(),
+      email: trimmedEmail,
       role: finalRole,
       bloodType: finalBloodType,
       location: finalCity,
@@ -75,7 +97,7 @@ export const Auth: React.FC = () => {
           : 'home';
       navigateTo(targetPage);
     } catch (err: any) {
-      // Toast shown in context
+      // Toast displayed by AuthContext
     } finally {
       setLoading(false);
     }
@@ -83,14 +105,17 @@ export const Auth: React.FC = () => {
 
   const handleSigninSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!loginEmail || !loginPassword) {
-      showToast('warning', '⚠️ Missing Credentials', 'Please enter your email and password.');
+    if (loading) return;
+
+    const trimmedLogin = loginEmail.trim();
+    if (!trimmedLogin || !loginPassword) {
+      showToast('warning', '⚠️ Missing Credentials', 'Please enter your email/username and password.');
       return;
     }
 
     setLoading(true);
     try {
-      const loggedUser = await login(loginEmail, loginPassword);
+      const loggedUser = await login(trimmedLogin, loginPassword);
       const targetPage: Page =
         loggedUser.role === 'Donor'
           ? 'donor-dash'
@@ -101,16 +126,18 @@ export const Auth: React.FC = () => {
           : 'dashboard';
       navigateTo(targetPage);
     } catch (err) {
-      // Toast handled in context
+      // Toast displayed by AuthContext
     } finally {
       setLoading(false);
     }
   };
 
   const handleGoogleSignIn = async () => {
+    if (loading) return;
     setLoading(true);
     try {
-      const loggedUser = await googleSignIn(activeTab === 'register' ? selectedRole : undefined);
+      const targetRole = activeTab === 'register' ? selectedRole : 'Donor';
+      const loggedUser = await googleSignIn(targetRole);
       const targetPage: Page =
         loggedUser.role === 'Donor'
           ? 'donor-dash'
@@ -121,7 +148,7 @@ export const Auth: React.FC = () => {
           : 'dashboard';
       navigateTo(targetPage);
     } catch (err) {
-      // Toast handled in context
+      // Toast displayed by AuthContext
     } finally {
       setLoading(false);
     }
@@ -325,15 +352,29 @@ export const Auth: React.FC = () => {
                   </>
                 )}
 
-                <div className="form-group">
-                  <label className="form-label">Password</label>
-                  <input 
-                    className="form-input" 
-                    type="password" 
-                    placeholder="Min. 6 characters" 
-                    value={registerPassword}
-                    onChange={(e) => setRegisterPassword(e.target.value)}
-                  />
+                <div className="form-grid-2">
+                  <div className="form-group">
+                    <label className="form-label">Password</label>
+                    <input 
+                      className="form-input" 
+                      type="password" 
+                      placeholder="Min. 6 characters" 
+                      value={registerPassword}
+                      onChange={(e) => setRegisterPassword(e.target.value)}
+                      autoComplete="new-password"
+                    />
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">Confirm Password</label>
+                    <input 
+                      className="form-input" 
+                      type="password" 
+                      placeholder="Re-enter password" 
+                      value={confirmPassword}
+                      onChange={(e) => setConfirmPassword(e.target.value)}
+                      autoComplete="new-password"
+                    />
+                  </div>
                 </div>
 
                 <button type="submit" className="btn btn-red btn-full btn-lg" style={{ marginTop: '.5rem' }} disabled={loading}>

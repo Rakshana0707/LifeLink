@@ -426,7 +426,18 @@ export interface AnalyticsSummary {
 const handleResponse = async (res: Response) => {
   if (!res.ok) {
     const errorData = await res.json().catch(() => ({}));
-    throw new Error(errorData.error || `HTTP error! status: ${res.status}`);
+    const message = errorData.error || (
+      res.status === 401 ? 'Authentication required. Please sign in.' :
+      res.status === 403 ? 'Access denied. You do not have permission.' :
+      res.status === 404 ? 'Requested resource not found.' :
+      res.status === 409 ? 'Conflict: Resource already exists.' :
+      res.status >= 500 ? 'Server error. Please try again later.' :
+      `HTTP error! status: ${res.status}`
+    );
+    const error: any = new Error(message);
+    error.status = res.status;
+    error.data = errorData;
+    throw error;
   }
   return res.json();
 };
@@ -450,6 +461,8 @@ export const setApiActor = (token: string | null) => {
     }
   } catch {}
 };
+
+export const getApiActor = (): string | null => _sessionToken;
 const authHeaders = (): Record<string, string> => ({
   'Content-Type': 'application/json',
   ..._sessionToken ? { Authorization: `Bearer ${_sessionToken}` } : {},
@@ -509,6 +522,16 @@ export const api = {
 
   getUserById: (id: string): Promise<User> =>
     authedFetch(`/api/users/${id}`).then(handleResponse),
+
+  getCurrentUser: (): Promise<User> =>
+    authedFetch('/api/users/me').then(handleResponse),
+
+  syncUser: (userData: Partial<User> & { email?: string }): Promise<User> =>
+    authedFetch('/api/users/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(userData),
+    }).then(handleResponse),
   
   createUser: (userData: Partial<User> & { password?: string }): Promise<User> =>
     authedFetch('/api/users', {

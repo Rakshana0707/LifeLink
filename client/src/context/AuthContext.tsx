@@ -1,15 +1,24 @@
-import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 import { api, setApiActor, type User } from '../api';
 import { useToast } from './ToastContext';
 import { auth } from '../firebase';
-import { createUserWithEmailAndPassword, signInWithEmailAndPassword, GoogleAuthProvider, signInWithPopup, onIdTokenChanged, signOut } from 'firebase/auth';
+import {
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  GoogleAuthProvider,
+  signInWithPopup,
+  onAuthStateChanged,
+  signOut,
+} from 'firebase/auth';
 
 interface AuthContextType {
   user: User | null;
+  role: string | null;
   isLoggedIn: boolean;
-  logout: () => void;
-  signup: (userData: Partial<User> & { password?: string, email: string }) => Promise<User>;
-  login: (email: string, password: string) => Promise<User>;
+  loading: boolean;
+  logout: () => Promise<void>;
+  signup: (userData: Partial<User> & { password?: string; email: string }) => Promise<User>;
+  login: (identifier: string, password: string) => Promise<User>;
   googleSignIn: (role?: 'Donor' | 'Patient' | 'Hospital' | 'Blood Bank') => Promise<User>;
   refreshUser: () => Promise<void>;
   updateUserContext: (updateData: any) => Promise<void>;
@@ -17,7 +26,7 @@ interface AuthContextType {
   reloadUsersList: () => Promise<void>;
 }
 
-// Helper to format auth errors into clean, user-friendly messages
+// Format auth errors into clean, user-friendly messages
 const getFriendlyErrorMessage = (err: any): string => {
   const code = err?.code || '';
   switch (code) {
@@ -31,8 +40,10 @@ const getFriendlyErrorMessage = (err: any): string => {
     case 'auth/wrong-password':
     case 'auth/invalid-credential':
       return 'Invalid email or password. Please check your credentials.';
+    case 'auth/user-disabled':
+      return 'This user account has been disabled. Please contact support.';
     case 'auth/too-many-requests':
-      return 'Too many attempts. Please wait a moment and try again.';
+      return 'Too many failed attempts. Please wait a moment and try again.';
     case 'auth/popup-closed-by-user':
       return 'Google sign-in popup was closed before completing.';
     case 'auth/popup-blocked':
@@ -48,116 +59,163 @@ const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [user, setUser] = useState<User | null>(null);
+  const [loading, setLoading] = useState<boolean>(true);
   const [usersList, setUsersList] = useState<User[]>([]);
   const { showToast } = useToast();
+  const isInitializingRef = useRef(true);
 
   const reloadUsersList = useCallback(async () => {
     try {
       const list = await api.getUsers();
       setUsersList(list);
-      
-      // Keep logged in user object updated
-      if (user) {
-        const freshUser = list.find((u) => u.id === user.id);
-        if (freshUser) {
-          setUser(freshUser);
-          localStorage.setItem('lifelink_user', JSON.stringify(freshUser));
+    } catch (err: any) {
+      console.warn('Failed to refresh users list:', err.message);
+    }
+  }, []);
+
+  // Main session restoration & auth state listener (Single listener pattern)
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      try {
+        if (firebaseUser) {
+          // 1. Firebase Auth user is present
+          const token = await firebaseUser.getIdToken();
+          setApiActor(token);
+
+          try {
+            // Attempt to fetch user profile from SQLite
+            const profile = await api.getCurrentUser();
+            setUser(profile);
+            localStorage.setItem('lifelink_user', JSON.stringify(profile));
+          } catch {
+            // Auto-heal orphaned or newly created Firebase accounts via backend sync
+            try {
+              const synced = await api.syncUser({
+                email: firebaseUser.email || undefined,
+                name: firebaseUser.displayName || undefined,
+                firebaseUid: firebaseUser.uid,
+                role: 'Donor',
+              });
+              setUser(synced);
+              localStorage.setItem('lifelink_user', JSON.stringify(synced));
+            } catch (syncErr: any) {
+              console.error('Failed to sync profile for Firebase user:', syncErr.message);
+            }
+          }
         } else {
-          setUser(null);
-          localStorage.removeItem('lifelink_user');
+          // 2. Firebase user is null. Check if an internal session token exists (for Demo / Admin accounts)
+          const localToken = localStorage.getItem('lifelink_token');
+          const savedUserStr = localStorage.getItem('lifelink_user');
+
+          if (localToken && savedUserStr) {
+            setApiActor(localToken);
+            try {
+              const verifiedProfile = await api.getCurrentUser();
+              setUser(verifiedProfile);
+              localStorage.setItem('lifelink_user', JSON.stringify(verifiedProfile));
+            } catch {
+              // Token expired or invalid, clear session
+              setApiActor(null);
+              setUser(null);
+              localStorage.removeItem('lifelink_user');
+            }
+          } else {
+            setApiActor(null);
+            setUser(null);
+            localStorage.removeItem('lifelink_user');
+          }
+        }
+      } catch (err) {
+        console.error('Error during auth state change processing:', err);
+      } finally {
+        if (isInitializingRef.current) {
+          isInitializingRef.current = false;
+          setLoading(false);
         }
       }
-    } catch (err: any) {
-      console.error("Failed to load users list:", err.message);
-    }
-  }, [user]);
-
-  // Keep Firebase token in sync with API client
-  useEffect(() => {
-    const unsubscribe = onIdTokenChanged(auth, async (firebaseUser) => {
-      if (firebaseUser) {
-        const token = await firebaseUser.getIdToken();
-        setApiActor(token);
-      } else {
-        setApiActor(null);
-      }
     });
+
+    // Populate user directory in background
+    api.getUsers().then(setUsersList).catch(() => {});
+
     return () => unsubscribe();
   }, []);
 
-  // Load user from localStorage on mount.
-  useEffect(() => {
-    const savedUser = localStorage.getItem('lifelink_user');
-    if (savedUser) {
-      try {
-        setUser(JSON.parse(savedUser));
-      } catch (e) {
-        localStorage.removeItem('lifelink_user');
-      }
-    }
-    api.getUsers().then(setUsersList).catch(console.error);
-  }, []);
+  const login = async (identifier: string, password: string): Promise<User> => {
+    const trimmedId = identifier.trim();
+    let loggedUser: User | null = null;
+    let authError: any = null;
 
-  const login = async (email: string, password: string): Promise<User> => {
-    try {
-      let loggedUser: User | null = null;
+    // 1. If identifier looks like an email, try Firebase Auth first
+    if (trimmedId.includes('@')) {
       try {
-        const fbCred = await signInWithEmailAndPassword(auth, email, password);
+        const fbCred = await signInWithEmailAndPassword(auth, trimmedId, password);
         const token = await fbCred.user.getIdToken();
         setApiActor(token);
 
+        // Fetch or auto-sync SQLite profile
         try {
-          loggedUser = await api.getUserById(fbCred.user.uid);
+          loggedUser = await api.getCurrentUser();
         } catch {
-          const list = await api.getUsers();
-          loggedUser = list.find((u) => u.id === fbCred.user.uid) || null;
+          loggedUser = await api.syncUser({
+            email: fbCred.user.email || trimmedId,
+            firebaseUid: fbCred.user.uid,
+            name: fbCred.user.displayName || trimmedId.split('@')[0],
+            role: 'Donor',
+          });
         }
       } catch (fbErr: any) {
-        // Fallback for demo/admin accounts in SQLite
-        try {
-          const res = await api.login(email, password);
-          loggedUser = res;
-          setApiActor(res.token);
-        } catch {
-          throw fbErr;
-        }
+        authError = fbErr;
       }
-
-      if (!loggedUser) throw new Error('User record not found in database.');
-
-      setUser(loggedUser);
-      localStorage.setItem('lifelink_user', JSON.stringify(loggedUser));
-      showToast('success', '✅ Welcome Back', `Logged in as ${loggedUser.name}`);
-      return loggedUser;
-    } catch (err: any) {
-      const friendlyMsg = getFriendlyErrorMessage(err);
-      showToast('warning', '❌ Sign In Failed', friendlyMsg);
-      throw new Error(friendlyMsg);
     }
+
+    // 2. If Firebase login didn't succeed or identifier is a username, try backend login (Demo & Admin accounts)
+    if (!loggedUser) {
+      try {
+        const res = await api.login(trimmedId, password);
+        loggedUser = res;
+        setApiActor(res.token);
+        // Clear any leftover Firebase session so demo auth is clean
+        await signOut(auth).catch(() => {});
+      } catch (localErr: any) {
+        // If both failed, use the most relevant error
+        const chosenErr = authError || localErr;
+        const friendlyMsg = getFriendlyErrorMessage(chosenErr);
+        showToast('warning', '❌ Sign In Failed', friendlyMsg);
+        throw new Error(friendlyMsg);
+      }
+    }
+
+    if (!loggedUser) {
+      const msg = 'User record not found. Please register or verify credentials.';
+      showToast('warning', '❌ Sign In Failed', msg);
+      throw new Error(msg);
+    }
+
+    setUser(loggedUser);
+    localStorage.setItem('lifelink_user', JSON.stringify(loggedUser));
+    showToast('success', '✅ Welcome Back', `Logged in as ${loggedUser.name}`);
+    await reloadUsersList();
+    return loggedUser;
   };
 
-  const logout = async () => {
+  const signup = async (userData: Partial<User> & { password?: string; email: string }): Promise<User> => {
     try {
-      await signOut(auth);
-    } catch (e) {}
-    setUser(null);
-    setApiActor(null);
-    localStorage.removeItem('lifelink_user');
-    showToast('info', '👋 Logged Out', 'You have been signed out successfully.');
-  };
-
-  const signup = async (userData: Partial<User> & { password?: string, email: string }): Promise<User> => {
-    try {
-      const fbCred = await createUserWithEmailAndPassword(auth, userData.email, userData.password || 'temporary_pass');
+      // 1. Create account in Firebase Auth
+      const fbCred = await createUserWithEmailAndPassword(auth, userData.email.trim(), userData.password || 'temporary_pass');
       const token = await fbCred.user.getIdToken();
       setApiActor(token);
 
-      // Create local SQL user
-      const newUser = await api.createUser({ ...userData, firebaseUid: fbCred.user.uid });
-      
+      // 2. Idempotently create/sync user record in SQLite with verified Firebase UID
+      const newUser = await api.syncUser({
+        ...userData,
+        email: userData.email.trim(),
+        firebaseUid: fbCred.user.uid,
+      });
+
       setUser(newUser);
       localStorage.setItem('lifelink_user', JSON.stringify(newUser));
-      showToast('success', '🎉 Account Created', 'Registration successful!');
+      showToast('success', '🎉 Account Created', 'Registration successful! Welcome to LifeLink.');
       await reloadUsersList();
       return newUser;
     } catch (err: any) {
@@ -174,28 +232,24 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const token = await fbCred.user.getIdToken();
       setApiActor(token);
 
-      const list = await api.getUsers();
-      let sqlUser = list.find(u => u.id === fbCred.user.uid);
-      
-      if (!sqlUser) {
-        if (!role) throw new Error("Role required for new registration.");
-        sqlUser = await api.createUser({
-          firebaseUid: fbCred.user.uid,
-          name: fbCred.user.displayName || 'Unknown',
-          email: fbCred.user.email || '',
-          role,
-          bloodType: role === 'Donor' ? 'O+' : 'Multiple',
-          location: 'Coimbatore',
-          status: 'Active',
-          password: 'GOOGLE_AUTH'
-        });
-        showToast('success', '🎉 Account Created', 'Signed in with Google!');
-      } else {
-        showToast('success', '✅ Welcome Back', `Logged in as ${sqlUser.name}`);
-      }
-      
+      const targetRole = role && ['Donor', 'Hospital', 'Blood Bank', 'Patient'].includes(role)
+        ? (role === 'Patient' ? 'Donor' : role)
+        : 'Donor';
+
+      // Self-provision or retrieve profile from SQLite
+      const sqlUser = await api.syncUser({
+        firebaseUid: fbCred.user.uid,
+        name: fbCred.user.displayName || 'LifeLink User',
+        email: fbCred.user.email || '',
+        role: targetRole,
+        bloodType: targetRole === 'Donor' ? 'O+' : 'Multiple',
+        location: 'Coimbatore',
+        status: 'Active',
+      });
+
       setUser(sqlUser);
       localStorage.setItem('lifelink_user', JSON.stringify(sqlUser));
+      showToast('success', '✅ Google Sign-In Successful', `Welcome, ${sqlUser.name}!`);
       await reloadUsersList();
       return sqlUser;
     } catch (err: any) {
@@ -205,15 +259,32 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   };
 
+  const logout = async () => {
+    try {
+      await signOut(auth);
+    } catch (e) {}
+    setApiActor(null);
+    setUser(null);
+    localStorage.removeItem('lifelink_user');
+    localStorage.removeItem('lifelink_token');
+    showToast('info', '👋 Signed Out', 'You have been signed out successfully.');
+  };
+
   const refreshUser = async () => {
-    await reloadUsersList();
+    try {
+      const profile = await api.getCurrentUser();
+      setUser(profile);
+      localStorage.setItem('lifelink_user', JSON.stringify(profile));
+    } catch {
+      await reloadUsersList();
+    }
   };
 
   const updateUserContext = async (updateData: any) => {
     if (!user) return;
     try {
       await api.updateUser(user.id, updateData);
-      await reloadUsersList();
+      await refreshUser();
     } catch (err: any) {
       showToast('warning', '❌ Update Failed', err.message || 'Could not update profile');
       throw err;
@@ -224,7 +295,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     <AuthContext.Provider
       value={{
         user,
+        role: user?.role || null,
         isLoggedIn: !!user,
+        loading,
         logout,
         signup,
         login,

@@ -1,4 +1,4 @@
-import { initializeApp } from "firebase/app";
+import { initializeApp, getApps, getApp } from "firebase/app";
 import { getAuth } from "firebase/auth";
 
 const firebaseConfig = {
@@ -10,10 +10,11 @@ const firebaseConfig = {
   appId: import.meta.env.VITE_FIREBASE_APP_ID,
 };
 
-const app = initializeApp(firebaseConfig);
-export const auth = getAuth(app);
+// Validate required configuration during initialization
+if (!firebaseConfig.apiKey || !firebaseConfig.projectId) {
+  console.warn("[Firebase] Warning: Missing VITE_FIREBASE_API_KEY or VITE_FIREBASE_PROJECT_ID in environment variables.");
+}
 
-// Use emulator if in development (Commented out to connect to live Firebase)
-// if (import.meta.env.DEV) {
-//   connectAuthEmulator(auth, "http://127.0.0.1:9099");
-// }
+// Maintain a single Firebase application and Auth instance
+const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+export const auth = getAuth(app);

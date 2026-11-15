@@ -23,9 +23,31 @@ async function getActorFromRequest(req, db) {
   // 1. Try Firebase ID Token verification
   try {
     const decodedToken = await getAuth().verifyIdToken(token);
-    const userId = decodedToken.uid;
-    const row = db.prepare('SELECT id, name, role, status FROM users WHERE id = ?').get(userId);
-    if (row) return row;
+    const uid = decodedToken.uid;
+    const email = decodedToken.email;
+
+    // Check if firebase_uid column exists in the table
+    let row = null;
+    try {
+      row = db.prepare('SELECT id, name, role, status FROM users WHERE id = ? OR firebase_uid = ?').get(uid, uid);
+    } catch {
+      row = db.prepare('SELECT id, name, role, status FROM users WHERE id = ?').get(uid);
+    }
+
+    // If not found by UID, match by email (links existing seeded or registered email profiles)
+    if (!row && email) {
+      row = db.prepare('SELECT id, name, role, status FROM users WHERE lower(email) = lower(?)').get(email);
+      if (row) {
+        try {
+          db.prepare('UPDATE users SET firebase_uid = ? WHERE id = ?').run(uid, row.id);
+        } catch {}
+      }
+    }
+
+    if (row) {
+      req.firebaseUser = decodedToken;
+      return row;
+    }
   } catch (err) {
     // Not a valid Firebase ID token or Firebase verify failed, try internal session token below
   }
@@ -44,4 +66,4 @@ async function getActorFromRequest(req, db) {
   return null;
 }
 
-module.exports = { getActorFromRequest };
+module.exports = { getActorFromRequest, admin: { getAuth } };

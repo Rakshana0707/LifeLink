@@ -25,6 +25,16 @@ if (process.env.TRUST_PROXY === 'true') app.set('trust proxy', 1);
 const db = new DatabaseSync(path.join(__dirname, 'lifelink.db'));
 db.exec('PRAGMA foreign_keys = ON;');
 console.log('Connected to the SQLite database (node:sqlite).');
+try {
+  const userCols = db.prepare('PRAGMA table_info(users)').all();
+  if (!userCols.some((c) => c.name === 'firebase_uid')) {
+    db.exec('ALTER TABLE users ADD COLUMN firebase_uid TEXT;');
+    db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_firebase_uid ON users(firebase_uid);');
+    console.log('[Database] Added firebase_uid column and index to users table.');
+  }
+} catch (migErr) {
+  console.error('[Database Migration Warning]', migErr.message);
+}
 ensureAuditTable(db);
 const auditLog = makeAuditLogger(db);
 
@@ -40,6 +50,21 @@ app.use(['/api/nlp', '/api/chat', '/api/rag'], createProxyMiddleware({
     }
   }
 }));
+
+// CORS middleware supporting credentials and preflights
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  }
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+  next();
+});
 
 app.use(express.json());
 
@@ -309,10 +334,108 @@ app.get('/api/users', async (req, res) => {
   }
 });
 
+app.get('/api/users/me', requireAuth, (req, res) => {
+  try {
+    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.actor.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json(withPrivateFieldsIfAuthorized(buildUserResponse(user), user, req.actor));
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+app.post('/api/users/sync', async (req, res) => {
+  try {
+    // 1. If actor is already authenticated and in SQLite, return their profile
+    const actor = await getActorFromRequest(req, db);
+    if (actor) {
+      const user = db.prepare('SELECT * FROM users WHERE id = ?').get(actor.id);
+      return res.json(withPrivateFieldsIfAuthorized(buildUserResponse(user), user, actor));
+    }
+
+    // 2. Otherwise verify Firebase token to safely self-provision or link SQLite record
+    const authHeader = req.headers['authorization'] || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
+    if (!token) return res.status(401).json({ error: 'Authentication required' });
+
+    let decodedToken;
+    try {
+      decodedToken = await admin.getAuth().verifyIdToken(token);
+    } catch (e) {
+      return res.status(401).json({ error: 'Invalid or expired Firebase token' });
+    }
+
+    const uid = decodedToken.uid;
+    const email = decodedToken.email || req.body.email || null;
+    const name = decodedToken.name || req.body.name || (email ? email.split('@')[0] : 'LifeLink User');
+    const requestedRole = req.body.role;
+    const role = (requestedRole && ['Donor', 'Hospital', 'Blood Bank', 'Patient'].includes(requestedRole))
+      ? (requestedRole === 'Patient' ? 'Donor' : requestedRole)
+      : 'Donor';
+    const bloodType = req.body.bloodType || 'O+';
+    const location = req.body.location || 'Coimbatore';
+
+    // Check if user already exists by UID, firebase_uid, or email
+    let existing = null;
+    try {
+      existing = db.prepare('SELECT * FROM users WHERE id = ? OR firebase_uid = ?').get(uid, uid);
+    } catch {
+      existing = db.prepare('SELECT * FROM users WHERE id = ?').get(uid);
+    }
+
+    if (!existing && email) {
+      existing = db.prepare('SELECT * FROM users WHERE lower(email) = lower(?)').get(email);
+      if (existing) {
+        try {
+          db.prepare('UPDATE users SET firebase_uid = ? WHERE id = ?').run(uid, existing.id);
+        } catch {}
+      }
+    }
+
+    if (existing) {
+      return res.json(withPrivateFieldsIfAuthorized(buildUserResponse(existing), existing, { id: existing.id, role: existing.role }));
+    }
+
+    // Provision new profile linked to Firebase UID
+    const prefix = role === 'Donor' ? 'LL' : role === 'Hospital' ? 'HP' : 'BB';
+    const passportId = `${prefix}-2026-CBE-${Math.floor(1000 + Math.random() * 9000)}`;
+    const locationId = findOrCreateLocation(location, null, null);
+
+    db.prepare(
+      `INSERT INTO users (id, name, email, phone, role, password_hash, telegram_chat_id, passport_id,
+                           status, is_new_registration, total_donations, xp, location_id, lat, lng, firebase_uid)
+       VALUES (?, ?, ?, NULL, ?, 'FIREBASE_AUTH_MANAGED', NULL, ?, 'Active', 0, 0, 0, ?, NULL, NULL, ?)`
+    ).run(uid, name, email, role, passportId, locationId, uid);
+
+    if (role === 'Donor') {
+      const groupId = groupIdByType[bloodType] || groupIdByType['O+'];
+      db.prepare(`INSERT INTO donor_profiles (user_id, blood_group_id, availability_status) VALUES (?, ?, 'Active')`).run(uid, groupId);
+    } else if (role === 'Hospital') {
+      db.prepare(`INSERT INTO hospital_profiles (user_id, location_id, verification_status) VALUES (?, ?, 'Pending Verification')`).run(uid, locationId);
+    } else if (role === 'Blood Bank') {
+      db.prepare(`INSERT INTO blood_bank_profiles (user_id, location_id, verification_status) VALUES (?, ?, 'Pending Verification')`).run(uid, locationId);
+      Object.values(groupIdByType).forEach((gId) => {
+        db.prepare('INSERT OR IGNORE INTO blood_inventory (blood_bank_id, blood_group_id, units) VALUES (?, ?, 0)').run(uid, gId);
+      });
+    }
+
+    const created = db.prepare('SELECT * FROM users WHERE id = ?').get(uid);
+    auditLog({ actorId: uid, actorRole: role, action: 'profile_synced', targetType: 'user', targetId: uid, ip: req.ip });
+    res.json(withPrivateFieldsIfAuthorized(buildUserResponse(created), created, { id: created.id, role: created.role }));
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
 app.get('/api/users/:id', async (req, res) => {
   try {
     const viewer = await getActorFromRequest(req, db);
-    const row = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
+    let row = null;
+    try {
+      row = db.prepare('SELECT * FROM users WHERE id = ? OR firebase_uid = ?').get(req.params.id, req.params.id);
+    } catch {
+      row = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
+    }
     if (!row) return res.status(404).json({ error: 'User not found' });
     res.json(withPrivateFieldsIfAuthorized(buildUserResponse(row), row, viewer));
   } catch (err) {
@@ -320,32 +443,76 @@ app.get('/api/users/:id', async (req, res) => {
   }
 });
 
-app.post('/api/users', rateLimit('register', 20, 3600000), (req, res) => {
+app.post('/api/users', rateLimit('register', 20, 3600000), async (req, res) => {
   try {
     const { name, role, bloodType, location, status, isNewRegistration, password, lat, lng, telegramChatId, licenseNumber, accreditationDoc, phone, email } = req.body;
 
-    // telegramChatId is no longer required with Firebase Auth
     if (!name || !role) {
       return res.status(400).json({ error: 'name and role are required.' });
     }
 
-    const prefix = role === 'Donor' ? 'LL' : role === 'Hospital' ? 'HP' : 'BB';
+    // Role Security: Disallow registering directly as Admin
+    if (role === 'Admin') {
+      return res.status(403).json({ error: 'Registration as Admin is strictly prohibited.' });
+    }
+
+    const ALLOWED_ROLES = ['Donor', 'Hospital', 'Blood Bank', 'Patient'];
+    if (!ALLOWED_ROLES.includes(role)) {
+      return res.status(400).json({ error: 'Invalid user role specified.' });
+    }
+    const finalRole = role === 'Patient' ? 'Donor' : role;
+
+    // Check Firebase token if provided to guarantee authenticated UID
+    let verifiedUid = null;
+    const authHeader = req.headers['authorization'] || '';
+    const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
+    if (bearerToken) {
+      try {
+        const decoded = await admin.getAuth().verifyIdToken(bearerToken);
+        verifiedUid = decoded.uid;
+      } catch {}
+    }
+
+    const effectiveUid = verifiedUid || req.body.firebaseUid || null;
+
+    // Check for duplicate user by UID or email to make registration idempotent
+    let existingUser = null;
+    if (effectiveUid) {
+      try {
+        existingUser = db.prepare('SELECT * FROM users WHERE id = ? OR firebase_uid = ?').get(effectiveUid, effectiveUid);
+      } catch {
+        existingUser = db.prepare('SELECT * FROM users WHERE id = ?').get(effectiveUid);
+      }
+    }
+    if (!existingUser && email) {
+      existingUser = db.prepare('SELECT * FROM users WHERE lower(email) = lower(?)').get(email);
+      if (existingUser && effectiveUid) {
+        try {
+          db.prepare('UPDATE users SET firebase_uid = ? WHERE id = ?').run(effectiveUid, existingUser.id);
+        } catch {}
+      }
+    }
+
+    if (existingUser) {
+      return res.json(withPrivateFieldsIfAuthorized(buildUserResponse(existingUser), existingUser, { id: existingUser.id, role: existingUser.role }));
+    }
+
+    const prefix = finalRole === 'Donor' ? 'LL' : finalRole === 'Hospital' ? 'HP' : 'BB';
     const passportId = `${prefix}-2026-CBE-${Math.floor(1000 + Math.random() * 9000)}`;
-    const finalStatus = status || (role === 'Donor' ? 'Active' : 'Verified');
+    const finalStatus = status || (finalRole === 'Donor' ? 'Active' : 'Verified');
     const newReg = isNewRegistration ? 1 : 0;
-    const initialXP = role === 'Donor' ? 0 : role === 'Blood Bank' ? 10000 : 5000;
-    const initialDonations = role === 'Donor' ? 0 : role === 'Blood Bank' ? 240 : 45;
+    const initialXP = finalRole === 'Donor' ? 0 : finalRole === 'Blood Bank' ? 10000 : 5000;
+    const initialDonations = finalRole === 'Donor' ? 0 : finalRole === 'Blood Bank' ? 240 : 45;
     
-    // With Firebase Auth, we expect the frontend to pass the generated Firebase UID as 'firebaseUid'
-    const id = req.body.firebaseUid || 'u' + Date.now();
+    const id = effectiveUid || 'u' + Date.now();
     const passwordHash = 'FIREBASE_AUTH_MANAGED'; 
     const locationId = findOrCreateLocation(location, lat ?? null, lng ?? null);
 
     db.prepare(
       `INSERT INTO users (id, name, email, phone, role, password_hash, telegram_chat_id, passport_id,
-                           status, is_new_registration, total_donations, xp, location_id, lat, lng)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(id, name, email || null, phone || null, role, passwordHash, telegramChatId, passportId, finalStatus, newReg, initialDonations, initialXP, locationId, lat ?? null, lng ?? null);
+                           status, is_new_registration, total_donations, xp, location_id, lat, lng, firebase_uid)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(id, name, email || null, phone || null, finalRole, passwordHash, telegramChatId || null, passportId, finalStatus, newReg, initialDonations, initialXP, locationId, lat ?? null, lng ?? null, effectiveUid || id);
 
     if (role === 'Donor') {
       const groupId = groupIdByType[bloodType] || groupIdByType['O+'];
@@ -738,7 +905,7 @@ app.get('/api/emergencies/:id/history', (req, res) => {
 // Emergency creation is intentionally reachable by any visitor (patients/families raising
 // an urgent request don't necessarily have a Hospital account) — so this stays unauthenticated
 // by design, but gets a strict rate limit since it fans out to notifications + DB writes.
-app.post('/api/emergencies', rateLimit('emergency-create', 20, 60000), (req, res) => {
+app.post('/api/emergencies', rateLimit('emergency-create', 20, 60000), async (req, res) => {
   try {
     const { id, patientName, bloodType, hospital, lat, lng, units, urgency, ward } = req.body;
     if (!patientName || !bloodType || !hospital || !units || !urgency) {
