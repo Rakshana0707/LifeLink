@@ -2,6 +2,7 @@ import React, { createContext, useContext, useState, useEffect, useCallback, use
 import { api, setApiActor, type User } from '../api';
 import { useToast } from './ToastContext';
 import { auth } from '../firebase';
+import { closeEventStream } from '../utils/sse';
 import {
   createUserWithEmailAndPassword,
   signInWithEmailAndPassword,
@@ -30,6 +31,17 @@ interface AuthContextType {
   usersList: User[];
   reloadUsersList: () => Promise<void>;
 }
+
+// Clean helper to purge all cached session tokens, user profiles, and route states
+export const clearAllAuthStorage = () => {
+  try {
+    localStorage.removeItem('lifelink_user');
+    localStorage.removeItem('lifelink_token');
+    sessionStorage.removeItem('lifelink_user');
+    sessionStorage.removeItem('lifelink_token');
+    sessionStorage.removeItem('lifelink_current_page');
+  } catch {}
+};
 
 // Format auth errors into clean, user-friendly messages
 export const getFriendlyErrorMessage = (err: any): string => {
@@ -81,19 +93,35 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, []);
 
   // Main session restoration & auth state listener (Single listener pattern)
+  // Restores session from Firebase or backend SQLite profile, ALWAYS verifying
+  // role and identity against the backend rather than trusting client storage.
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
       try {
         if (firebaseUser) {
-          // 1. Firebase Auth user is present
-          const token = await firebaseUser.getIdToken();
-          // Check where token or user was saved previously
+          // 1. Firebase Auth user is detected
+          let token: string | null = null;
+          try {
+            token = await firebaseUser.getIdToken();
+          } catch (tokenErr) {
+            // Revoked token or deleted Firebase account
+            console.warn('Firebase token retrieval failed (revoked or deleted):', tokenErr);
+            await signOut(auth).catch(() => {});
+            clearAllAuthStorage();
+            setApiActor(null);
+            setUser(null);
+            return;
+          }
+
           const isSessionOnly = !!sessionStorage.getItem('lifelink_token') && !localStorage.getItem('lifelink_token');
           setApiActor(token, !isSessionOnly);
 
           try {
-            // Attempt to fetch user profile from SQLite
+            // Retrieve verified user profile from SQLite backend
             const profile = await api.getCurrentUser();
+            if (!profile || !profile.role) {
+              throw new Error('Invalid backend user profile structure');
+            }
             setUser(profile);
             if (isSessionOnly) {
               sessionStorage.setItem('lifelink_user', JSON.stringify(profile));
@@ -102,8 +130,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
               localStorage.setItem('lifelink_user', JSON.stringify(profile));
               sessionStorage.removeItem('lifelink_user');
             }
-          } catch {
-            // Auto-heal orphaned or newly created Firebase accounts via backend sync
+          } catch (profileErr: any) {
+            // Backend profile missing or unlinked; auto-heal genuine Firebase user
             try {
               const synced = await api.syncUser({
                 email: firebaseUser.email || undefined,
@@ -111,52 +139,61 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
                 firebaseUid: firebaseUser.uid,
                 role: 'Donor',
               });
-              setUser(synced);
-              if (isSessionOnly) {
-                sessionStorage.setItem('lifelink_user', JSON.stringify(synced));
+              if (synced && synced.role) {
+                setUser(synced);
+                if (isSessionOnly) {
+                  sessionStorage.setItem('lifelink_user', JSON.stringify(synced));
+                } else {
+                  localStorage.setItem('lifelink_user', JSON.stringify(synced));
+                }
               } else {
-                localStorage.setItem('lifelink_user', JSON.stringify(synced));
+                throw new Error('Sync failed to return valid profile');
               }
             } catch (syncErr: any) {
-              console.error('Failed to sync profile for Firebase user:', syncErr.message);
+              console.error('Failed to restore or auto-provision Firebase profile:', syncErr.message);
+              clearAllAuthStorage();
+              setApiActor(null);
+              setUser(null);
+              await signOut(auth).catch(() => {});
             }
           }
         } else {
-          // 2. Firebase user is null. Check if an internal session token exists (for Demo / Admin accounts)
+          // 2. Firebase user is null. Check if an internal session token exists (Demo / Admin accounts)
           const localToken = localStorage.getItem('lifelink_token') || sessionStorage.getItem('lifelink_token');
-          const savedUserStr = localStorage.getItem('lifelink_user') || sessionStorage.getItem('lifelink_user');
 
-          if (localToken && savedUserStr) {
+          if (localToken) {
             const isSessionOnly = !!sessionStorage.getItem('lifelink_token') && !localStorage.getItem('lifelink_token');
             setApiActor(localToken, !isSessionOnly);
             try {
+              // ALWAYS verify the user's role from the backend database
               const verifiedProfile = await api.getCurrentUser();
+              if (!verifiedProfile || !verifiedProfile.role) {
+                throw new Error('User record missing or unverified');
+              }
               setUser(verifiedProfile);
               if (isSessionOnly) {
                 sessionStorage.setItem('lifelink_user', JSON.stringify(verifiedProfile));
               } else {
                 localStorage.setItem('lifelink_user', JSON.stringify(verifiedProfile));
               }
-            } catch {
-              // Token expired or invalid, clear session
+            } catch (backendErr: any) {
+              // Expired, revoked token, or deleted database user
+              console.warn('Session verification rejected by backend:', backendErr.message);
+              clearAllAuthStorage();
               setApiActor(null);
               setUser(null);
-              localStorage.removeItem('lifelink_user');
-              localStorage.removeItem('lifelink_token');
-              sessionStorage.removeItem('lifelink_user');
-              sessionStorage.removeItem('lifelink_token');
             }
           } else {
+            clearAllAuthStorage();
             setApiActor(null);
             setUser(null);
-            localStorage.removeItem('lifelink_user');
-            localStorage.removeItem('lifelink_token');
-            sessionStorage.removeItem('lifelink_user');
-            sessionStorage.removeItem('lifelink_token');
           }
         }
       } catch (err) {
         console.error('Error during auth state change processing:', err);
+        clearAllAuthStorage();
+        setApiActor(null);
+        setUser(null);
       } finally {
         if (isInitializingRef.current) {
           isInitializingRef.current = false;
@@ -341,12 +378,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     try {
       await signOut(auth);
     } catch (e) {}
+    // Close and clean up all SSE connections
+    closeEventStream();
+    // Invalidate API actor token
     setApiActor(null);
+    // Reset AuthContext state
     setUser(null);
-    localStorage.removeItem('lifelink_user');
-    localStorage.removeItem('lifelink_token');
-    sessionStorage.removeItem('lifelink_user');
-    sessionStorage.removeItem('lifelink_token');
+    // Purge cached storage
+    clearAllAuthStorage();
     showToast('info', 'Signed Out', 'You have been signed out successfully.');
   };
 

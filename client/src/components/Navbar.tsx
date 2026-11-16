@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { useAuth } from '../context/AuthContext';
-import { useRouting, type Page } from '../context/RoutingContext';
+import { useRouting, type Page, getRoleHomePage } from '../context/RoutingContext';
 import { useToast } from '../context/ToastContext';
 import { api } from '../api';
 
@@ -41,13 +41,7 @@ export const Navbar: React.FC = () => {
 
   const getDashboardPage = (): Page => {
     if (!user) return 'auth';
-    switch (user.role) {
-      case 'Admin': return 'dashboard';
-      case 'Donor': return 'donor-dash';
-      case 'Hospital': return 'hospital';
-      case 'Blood Bank': return 'bloodbank';
-      default: return 'home';
-    }
+    return getRoleHomePage(user.role);
   };
 
   const handleNav = (target: Page, e?: React.MouseEvent) => {
@@ -199,7 +193,7 @@ export const Navbar: React.FC = () => {
                 </button>
                 <button 
                   className="btn btn-gray btn-sm" 
-                  onClick={() => { logout(); navigateTo('home'); }}
+                  onClick={async () => { await logout(); navigateTo('auth', { tab: 'signin' }); }}
                 >
                   Sign Out
                 </button>
@@ -299,7 +293,7 @@ export const Navbar: React.FC = () => {
             {isLoggedIn ? (
               <>
                 <li><a onClick={(e) => handleNav(getDashboardPage(), e)} href="#">My Portal ({user?.role})</a></li>
-                <li><a onClick={(e) => { e.preventDefault(); logout(); navigateTo('home'); setMobileMenuOpen(false); }} href="#">Sign Out</a></li>
+                <li><a onClick={async (e) => { e.preventDefault(); await logout(); navigateTo('auth', { tab: 'signin' }); setMobileMenuOpen(false); }} href="#">Sign Out</a></li>
               </>
             ) : (
               <li><a onClick={(e) => handleNav('auth', e)} href="#">Sign In / Register</a></li>

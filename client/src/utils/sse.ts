@@ -63,3 +63,18 @@ export const useEventStream = (eventType: string, handler: EventHandler, active 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [eventType, active]);
 };
+
+/**
+ * Forcibly close and unsubscribe from all active SSE streams (used on logout).
+ */
+export const closeEventStream = () => {
+  if (sharedSource) {
+    try {
+      sharedSource.close();
+    } catch {}
+    sharedSource = null;
+  }
+  listeners.clear();
+  attachedNativeTypes.clear();
+  refCount = 0;
+};

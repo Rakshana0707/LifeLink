@@ -1,6 +1,13 @@
 import React, { useEffect, useRef, Suspense, lazy } from 'react';
 import { ToastProvider } from './context/ToastContext';
-import { RoutingProvider, useRouting, type Page } from './context/RoutingContext';
+import {
+  RoutingProvider,
+  useRouting,
+  type Page,
+  isPageRoleGated,
+  isPagePermitted,
+  getRoleHomePage,
+} from './context/RoutingContext';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { useToast } from './context/ToastContext';
 import { Navbar } from './components/Navbar';
@@ -8,10 +15,7 @@ import { Chatbot } from './components/Chatbot';
 import { Footer } from './components/Footer';
 import { ErrorBoundary } from './components/ErrorBoundary';
 
-// Pages are code-split by route: each page (and its dependencies, e.g. the
-// Leaflet map or Recharts bundles) only downloads when the user actually
-// navigates there, instead of all being bundled into one ~1MB chunk that
-// every visitor pays for on first load.
+// Lazy-loaded routes for optimal bundle code-splitting
 const Home = lazy(() => import('./pages/Home').then((m) => ({ default: m.Home })));
 const EmergencyBoard = lazy(() => import('./pages/Emergency').then((m) => ({ default: m.EmergencyBoard })));
 const FindBlood = lazy(() => import('./pages/FindBlood').then((m) => ({ default: m.FindBlood })));
@@ -32,52 +36,107 @@ const DonorDashboard = lazy(() => import('./pages/Dashboards/DonorDashboard').th
 const HospitalDashboard = lazy(() => import('./pages/Dashboards/HospitalDashboard').then((m) => ({ default: m.HospitalDashboard })));
 const BloodBankDashboard = lazy(() => import('./pages/Dashboards/BloodBankDashboard').then((m) => ({ default: m.BloodBankDashboard })));
 
-const PageLoading: React.FC = () => (
+const PageLoading: React.FC<{ message?: string }> = ({ message = 'Loading LifeLink Portal...' }) => (
   <div
     role="status"
-    aria-label="Loading page"
-    style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '50vh' }}
+    aria-label={message}
+    style={{
+      display: 'flex',
+      flexDirection: 'column',
+      alignItems: 'center',
+      justifyContent: 'center',
+      minHeight: '60vh',
+      gap: '16px',
+    }}
   >
     <div
       aria-hidden="true"
       style={{
-        width: '36px',
-        height: '36px',
+        width: '42px',
+        height: '42px',
         borderRadius: '50%',
         border: '3px solid var(--gr4)',
         borderTopColor: 'var(--red)',
         animation: 'spin 0.7s linear infinite',
       }}
     />
+    <div style={{ fontSize: '13px', color: 'var(--gr)', fontWeight: 600 }}>{message}</div>
   </div>
 );
 
-// Pages that show personal account data - only unlocked after sign in / registration.
-// Everything else (Home, Emergency board, Find Blood, Live Map, AI Match, Camps,
-// Leaderboard) stays public so LifeLink still functions as a general resource.
-const PRIVATE_PAGES: Page[] = ['donor-dash', 'hospital', 'bloodbank', 'dashboard', 'passport', 'notifications', 'notification-preferences', 'analytics', 'forecast'];
+// Pages that require user authentication
+const PRIVATE_PAGES: Page[] = [
+  'donor',
+  'donor-dash',
+  'hospital',
+  'bloodbank',
+  'admin',
+  'dashboard',
+  'passport',
+  'notifications',
+  'notification-preferences',
+  'analytics',
+  'forecast',
+];
 
 const AppContent: React.FC = () => {
   const { page, navigateTo } = useRouting();
-  const { isLoggedIn, loading } = useAuth();
+  const { user, isLoggedIn, loading } = useAuth();
   const { showToast } = useToast();
-  const warnedRef = useRef<Page | null>(null);
+  const warnedRef = useRef<string | null>(null);
 
-  const isGated = !loading && PRIVATE_PAGES.includes(page) && !isLoggedIn;
+  const isPrivate = PRIVATE_PAGES.includes(page);
+  const isRoleGated = isPageRoleGated(page);
+  const isAuthorized = !isRoleGated || (isLoggedIn && isPagePermitted(page, user?.role));
 
+  // Role-based protection & redirect router guard
   useEffect(() => {
-    if (!loading && isGated && warnedRef.current !== page) {
-      warnedRef.current = page;
-      showToast('warning', '🔒 Members Only', 'Sign in or register to unlock your personal dashboard.');
-      navigateTo('auth');
+    if (loading) return;
+
+    // 1. Unauthenticated access to protected route -> Redirect to login
+    if (isPrivate && !isLoggedIn) {
+      const warnKey = `unauth:${page}`;
+      if (warnedRef.current !== warnKey) {
+        warnedRef.current = warnKey;
+        showToast('warning', 'Sign In Required', 'Please sign in or register to access this portal.');
+      }
+      navigateTo('auth', { from: page, tab: 'signin' });
+      return;
     }
-    if (!isGated) warnedRef.current = null;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page, isLoggedIn, loading]);
+
+    // 2. Authenticated user visiting /login or /auth -> Redirect to their role dashboard
+    if (isLoggedIn && page === 'auth') {
+      const roleHome = getRoleHomePage(user?.role);
+      navigateTo(roleHome);
+      return;
+    }
+
+    // 3. Authenticated user attempting to access dashboard of another role -> Redirect to own dashboard
+    if (isLoggedIn && isRoleGated && !isAuthorized) {
+      const correctHome = getRoleHomePage(user?.role);
+      const warnKey = `forbidden:${page}:${user?.role}`;
+      if (warnedRef.current !== warnKey) {
+        warnedRef.current = warnKey;
+        showToast('warning', 'Access Restricted', 'You cannot access dashboards belonging to other roles.');
+      }
+      navigateTo(correctHome);
+      return;
+    }
+
+    warnedRef.current = null;
+  }, [page, isLoggedIn, loading, isPrivate, isRoleGated, isAuthorized, user?.role, navigateTo, showToast]);
 
   const renderPage = () => {
-    if (loading) return <PageLoading />;
-    if (isGated) return <Auth />;
+    // Show loading spinner while session restoration and verification is running
+    if (loading) return <PageLoading message="Verifying session and security credentials..." />;
+
+    // Block render if unauthenticated on private route
+    if (isPrivate && !isLoggedIn) return <Auth />;
+
+    // Block render if wrong role on role-gated route
+    if (isLoggedIn && isRoleGated && !isAuthorized) {
+      return <PageLoading message="Redirecting to authorized portal..." />;
+    }
 
     switch (page) {
       case 'home':
@@ -106,12 +165,14 @@ const AppContent: React.FC = () => {
         return <Forecast />;
       case 'auth':
         return <Auth />;
+      case 'donor':
       case 'donor-dash':
         return <DonorDashboard />;
       case 'hospital':
         return <HospitalDashboard />;
       case 'bloodbank':
         return <BloodBankDashboard />;
+      case 'admin':
       case 'dashboard':
         return <AdminDashboard />;
       default:

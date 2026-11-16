@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth } from '../context/AuthContext';
-import { useRouting, type Page } from '../context/RoutingContext';
+import { useRouting, type Page, getRoleHomePage, isPagePermitted } from '../context/RoutingContext';
 import { useToast } from '../context/ToastContext';
 import { api } from '../api';
 import {
@@ -157,17 +157,12 @@ export const Auth: React.FC = () => {
   // NAVIGATION ROUTER
   // ----------------------------------------------------
   const routeUserToPortal = (role: string) => {
-    const targetPage: Page =
-      role === 'Donor'
-        ? 'donor-dash'
-        : role === 'Hospital'
-        ? 'hospital'
-        : role === 'Blood Bank'
-        ? 'bloodbank'
-        : role === 'Admin'
-        ? 'dashboard'
-        : 'home';
-    navigateTo(targetPage);
+    const fromPage = routeState && typeof routeState === 'object' && 'from' in routeState ? (routeState.from as Page) : null;
+    if (fromPage && fromPage !== 'auth' && isPagePermitted(fromPage, role)) {
+      navigateTo(fromPage);
+      return;
+    }
+    navigateTo(getRoleHomePage(role));
   };
 
   // ----------------------------------------------------

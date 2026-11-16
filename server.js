@@ -104,10 +104,25 @@ const escapeHtml = (str) =>
 
 
 
+const normalizeRoleBackend = (r) => {
+  if (!r) return '';
+  const lower = String(r).toLowerCase().replace(/[\s-]+/g, '_');
+  if (lower === 'donor' || lower === 'patient') return 'donor';
+  if (lower === 'hospital') return 'hospital';
+  if (lower === 'blood_bank' || lower === 'bloodbank') return 'blood_bank';
+  if (lower === 'admin') return 'admin';
+  return lower;
+};
+
 const requireRole = (...roles) => async (req, res, next) => {
   const actor = await getActorFromRequest(req, db);
   if (!actor) return res.status(401).json({ error: 'Authentication required.' });
-  if (!roles.includes(actor.role)) {
+  if (actor.status === 'Suspended' || actor.status === 'Disabled') {
+    return res.status(403).json({ error: 'Account suspended.' });
+  }
+  const actorNorm = normalizeRoleBackend(actor.role);
+  const matched = roles.some((r) => r === actor.role || normalizeRoleBackend(r) === actorNorm);
+  if (!matched) {
     return res.status(403).json({ error: `Access denied. Required role: ${roles.join(' or ')}.` });
   }
   req.actor = actor;
@@ -118,6 +133,9 @@ const requireRole = (...roles) => async (req, res, next) => {
 const requireAuth = async (req, res, next) => {
   const actor = await getActorFromRequest(req, db);
   if (!actor) return res.status(401).json({ error: 'Authentication required.' });
+  if (actor.status === 'Suspended' || actor.status === 'Disabled') {
+    return res.status(403).json({ error: 'Account suspended.' });
+  }
   req.actor = actor;
   next();
 };
@@ -561,6 +579,12 @@ app.put('/api/users/:id', requireAuth, (req, res) => {
   try {
     const actor = req.actor;
     const { id } = req.params;
+
+    // Security: Prevent unauthorized role changes
+    if (req.body.role && req.body.role !== actor.role && actor.role !== 'Admin') {
+      return res.status(403).json({ error: 'You are not authorized to modify user roles.' });
+    }
+
     const {
       name, location, bloodType, status, donations, xp, isNewRegistration, pendingUpdate,
       approveUpdate, rejectUpdate, approveOnboarding, denyOnboarding, activeCampRegistration,
