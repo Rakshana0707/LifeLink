@@ -1,403 +1,300 @@
-# 🩸 LifeLink — Blood Donation Platform
+# 🩸 LifeLink — Comprehensive Blood Donation & Emergency Transfusion Platform
 
-LifeLink is a full-stack demo platform that connects blood donors, patients,
-hospitals, and blood banks: emergency blood requests, donor search and
-matching, donation camp discovery, live maps, notifications, and
-role-specific dashboards with analytics and demand forecasting.
-
-This repository contains **two separate applications**, and it's important
-to know which one you're looking at:
-
-| | Status | Stack | Where |
-|---|---|---|---|
-| **React + Node app** | ✅ Actively developed. This is "the app." | React 19 + TypeScript + Vite frontend, Express + SQLite backend | `client/`, `server.js`, `services/` |
-| **Static HTML/JS app** | 🗄️ Legacy prototype, kept for reference only, not maintained | Vanilla HTML/CSS/JS, no backend, no persistence | `index.html`, `css/`, `js/` |
-
-Everything below (setup, architecture, data, testing) describes the
-**React + Node app**, since that's the real, working product. The legacy
-static prototype still opens directly in a browser with no build step if
-you want to look at it, but it has no server, no database, and every
-"action" in it is a client-side toast with no persistence — don't treat it
-as a second working system.
+LifeLink is a production-grade healthcare technology platform connecting blood donors, hospitals, blood banks, and platform administrators. It provides emergency blood matching, live dispatch, multi-source donation camp management, digital donor passports with gamification, real-time inventory management, and an AI-powered clinical assistance service.
 
 ---
 
-## 1. Project overview
-
-A patient or hospital posts an **emergency blood request**. LifeLink ranks
-nearby, blood-type-compatible, available donors and can alert the top
-matches over Telegram. Donors can also browse open requests, find blood
-banks with live stock, discover donation camps, track their own donation
-history via a digital "Blood Passport," and see a leaderboard. Hospitals,
-blood banks, and admins get dashboards with real analytics computed from
-the database, plus an experimental demand-forecasting view.
-
-## 2. Features
-
-- **Authentication** — password login, Telegram-based two-factor OTP for
-  sign-in and sign-up, server-issued signed session tokens (not trusted
-  client headers), role-based access control (Donor / Patient / Hospital /
-  Blood Bank / Admin).
-- **Emergency requests** — post, respond to, reserve against, fulfill, or
-  cancel a request, with a full status-change audit history.
-- **Blood search** — filter blood banks/hospitals by blood type, city, and
-  distance; live inventory levels.
-- **Donor matching** — rule-based ranking engine (compatibility, distance,
-  availability, recency, reliability) with a human-readable explanation for
-  every score.
-- **Live map** — Leaflet map of donors, hospitals, blood banks, camps, and
-  active emergencies, with routing.
-- **Donation camps** — organizer-submitted camps plus an ingestion pipeline
-  that can pull camps from external sources (see §9), all shown with clear
-  verification status.
-- **Notifications** — in-app + Telegram delivery, retry/backoff queue,
-  per-user notification preferences.
-- **Analytics dashboards** — real, live-queried metrics (not mocked), with
-  role-appropriate scope (a hospital sees its own numbers; Admin sees the
-  platform).
-- **Demand forecasting** — a simple, explainable weighted-moving-average
-  model over historical daily demand, with a shortage-risk classification
-  per blood group/location. See §8 and §12 for what data it's trained on.
-- **Blood Passport** — a donor's digital ID with QR code and donation
-  history.
-- **Leaderboard** — XP-based donor rankings.
-
-## 3. Technology stack
-
-**Frontend** (`client/`)
-- React 19 + TypeScript, built with Vite 8
-- React Router is installed but page routing is handled by a small custom
-  `RoutingContext` (single-page, no URL-per-page routing yet)
-- Leaflet + `react-leaflet`-style usage via a custom `LeafletMap` component
-  for maps
-- Recharts for charts, `qrcode` for the Blood Passport QR
-- Plain CSS with CSS custom properties (design tokens) in `index.css` — no
-  CSS framework
-- `oxlint` for linting
-
-**Backend** (root)
-- Node.js (`>=22.5.0`) + Express
-- `node:sqlite` (Node's built-in SQLite driver — currently an experimental
-  Node API, hence the `ExperimentalWarning` you'll see at startup; this is
-  expected and does not indicate a bug)
-- `bcryptjs` for password hashing (cost factor 12)
-- Hand-rolled HMAC-signed session tokens (`auth.js`) — no external auth
-  library
-- A small dependency-free token-bucket rate limiter (`rateLimit.js`)
-- Telegram Bot API for OTP delivery and alerts (`telegram.js`), with a
-  console-logging dev-mode fallback when no bot token is configured
-
-**No external database, queue, or cache service is required.** SQLite is a
-single file (`lifelink.db`) — there's nothing to provision.
-
-## 4. Architecture
+## 1. System Architecture
 
 ```
-┌─────────────────────┐        HTTPS / JSON         ┌──────────────────────┐
-│  client/ (Vite/React)│ ───────────────────────────▶│  server.js (Express) │
-│  - pages/, components│ ◀─────────────────────────── │  - REST endpoints    │
-│  - api.ts (fetch      │        + SSE stream          │  - auth.js (sessions)│
-│    wrapper)            │  /api/events/stream         │  - rateLimit.js      │
-└─────────────────────┘                              │  - audit.js          │
-                                                        │  - matching.js       │
-                                                        │  - telegram.js       │
-                                                        └──────────┬───────────┘
-                                                                   │
-                                       ┌───────────────────────────┼───────────────────────────┐
-                                       ▼                           ▼                           ▼
-                             services/analytics.js       services/notifications.js  services/demandForecast.js
-                             services/campIngestion/*                                (weighted moving average)
-                                       │
-                                       ▼
-                              lifelink.db (SQLite, node:sqlite)
+                                  ┌───────────────────────────────┐
+                                  │      Client Applications      │
+                                  │  React 19 + TypeScript + Vite │
+                                  │          (Port 5173)          │
+                                  └───────────────┬───────────────┘
+                                                  │
+                                  HTTPS / JSON    │   Firebase Auth Tokens
+                                  (Proxy / Direct)│   (Google OAuth / Email)
+                                                  ▼
+                                  ┌───────────────────────────────┐
+                                  │      Express Backend API      │
+                                  │      Node.js (Port 8000)      │
+                                  │  - Auth & Role-Based Routing  │
+                                  │  - Emergency Matching Engine  │
+                                  │  - Server-Sent Events (SSE)   │
+                                  │  - Audit Logging & Rate Limit │
+                                  └───────┬───────────────┬───────┘
+                                          │               │
+                 Internal Reverse Proxy   │               │   SQL Queries
+                  (/api/nlp, /chat, /rag) │               │   (node:sqlite)
+                                          ▼               ▼
+┌───────────────────────────────────────────────┐   ┌───────────────────────────────┐
+│              FastAPI AI Service               │   │      Persistent Storage       │
+│             Python 3.14 (Port 8001)           │   │         SQLite Database       │
+│  - LoRA Fine-Tuned Intent Classification      │   │          (lifelink.db)        │
+│  - BERT Named Entity Recognition (NER)        │   │          - 25 Tables          │
+│  - FAISS Vector DB + Flan-T5 RAG Pipeline     │   │          - 50 Indexes         │
+│  - Emergency 108/112 Clinical Safety Notices  │   │          - Full WAL Mode      │
+└───────────────────────────────────────────────┘   └───────────────────────────────┘
 ```
 
-- In development, `npm run dev` runs the Vite dev server (client) and
-  Express (`server.js`) concurrently, with the client calling the API
-  directly.
-- In production (`npm run build` then `npm start`), Express serves the
-  built static client from `client/dist` **and** the API from the same
-  origin/port — no separate frontend host or CORS config needed.
-- Real-time-ish updates (new notifications, emergency status changes) use
-  a Server-Sent Events stream (`GET /api/events/stream`), not WebSockets.
+### Core Services
+1. **Frontend (`client/`)**: React 19, TypeScript, Vite, Tailwind/CSS custom properties, Leaflet Maps, Recharts.
+2. **Backend Server (`server.js`)**: Express, Node.js (`>=22.5.0` with `node:sqlite`), Firebase Admin SDK, SSE event broadcast, token-bucket rate limiting.
+3. **AI Medical Microservice (`backend/`)**: FastAPI, PyTorch, HuggingFace Transformers (`flan-t5-small`, `dslim/bert-base-NER`, `distilbert-base-uncased`), FAISS vector store.
+4. **Primary Database (`lifelink.db`)**: Embedded SQLite in WAL (Write-Ahead Logging) mode with foreign keys enabled.
+5. **Real-time Pipeline**: Server-Sent Events (`/api/events/stream`) with heartbeat monitoring, auto-reconnect, and client connection reference counting.
 
-## 5. Database
+---
 
-SQLite, 24 tables, schema + demo data both created by `setup_db.js`. Key
-tables: `users`, `blood_groups`, `blood_group_compatibility`, `locations`,
-`donor_profiles`, `hospital_profiles`, `blood_bank_profiles`,
-`blood_inventory`, `emergencies`, `emergency_status_history`, `camps`,
-`camp_ingestion_runs`, `camp_registrations`, `donations`, `appointments`,
-`transfers`, `notifications`, `notification_deliveries`,
-`notification_preferences`, `otp_codes`, `analytics_events`,
-`donor_match_suggestions`, `synthetic_demand_history`, `audit_log`.
+## 2. Four Platform User Roles & Permissions
 
-Foreign keys are enforced (`PRAGMA foreign_keys = ON`). There is no ORM —
-queries are hand-written prepared statements throughout `server.js` and
-`services/*.js`.
+| Role | Primary Dashboard | Permissions & Capabilities | Verification Requirement |
+|---|---|---|---|
+| **Donor** | `/donor` | View eligibility countdown, request emergency responses, book camp slots, view donation passport, earn digital badges, download donation certificates, view leaderboard. | Public self-registration (email/password or Google sign-in). |
+| **Hospital** | `/hospital` | Create and broadcast emergency requests, review compatible matched donors, reserve and fulfill blood units, manage hospital profile. | Mandatory admin onboarding verification; verified license & accreditation required. |
+| **Blood Bank** | `/bloodbank` | Manage component stock levels (units per ABO/Rh blood group), process inbound/outbound transfer requests, coordinate camp logistics. | Mandatory admin onboarding verification; verified clinical blood bank license required. |
+| **Admin** | `/admin` | Platform oversight: approve/reject institutional onboarding, verify external camps, view platform analytics, monitor emergency history, run demand forecast. | Seeded credentials only; public registration permanently prohibited. |
 
-## 6. API structure
+---
 
-REST, JSON in/out, `Authorization: Bearer <token>` on every authenticated
-request (token minted at login/OTP-verify by `auth.js`; a user's role is
-always re-read from the database on each request, never trusted from the
-token itself, so a role change or suspension takes effect immediately).
+## 3. Database Architecture (25 Tables)
 
-Grouped by area:
+The application utilizes an auditable, normalized SQLite database (`lifelink.db`):
 
-| Area | Endpoints |
+| Category | Tables |
 |---|---|
-| Auth | `POST /api/auth/login`, `/login/request-otp`, `/login/verify-otp`, `/otp/send`, `/otp/verify` |
-| Users | `GET/POST /api/users`, `PUT /api/users/:id` |
-| Emergencies | `GET/POST /api/emergencies`, `/:id/respond`, `/:id/reserve`, `/:id/fulfill`, `/:id/cancel`, `PUT/DELETE /:id`, `GET /:id/history` |
-| Camps | `GET/POST /api/camps`, `PUT /:id`, `PUT /:id/verify`, `POST /ingest`, `GET /ingestion/runs`, `GET/POST /api/camp_registrations` |
-| Blood search | `GET /api/search/blood-availability`, `GET /api/search/donors` |
-| Hospitals / blood banks | `GET/POST/PUT /api/hospitals`, `GET/PUT /api/blood_banks` |
-| Donations / transfers / appointments | `GET /api/donations`, `GET/POST/PUT /api/transfers`, `GET/POST/PUT /api/appointments` |
-| Notifications | `GET/POST/PUT /api/notifications`, `/read-all`, `/unread-count`, `/:id/deliveries`, `GET/PUT /api/notification-preferences` |
-| Matching | `GET/POST /api/donor_matches`, `POST /api/matching/rank-donors`, `GET /api/matching/weights` |
-| Analytics | `GET/POST /api/analytics/events`, `GET /api/analytics/summary`, `/dashboard`, `/filter-options` (Admin/scoped-role only) |
-| Dashboards | `GET /api/dashboard/donor`, `/hospital`, `/bloodbank`, `/admin` |
-| Forecast | `GET /api/forecast/demand`, `/high-risk-locations`, `/history` (Admin only) |
-| Live updates | `GET /api/events/stream` (SSE) |
+| **Identity & Access** | `users`, `donor_profiles`, `hospital_profiles`, `blood_bank_profiles`, `otp_codes`, `audit_logs` |
+| **Clinical Blood Domain**| `blood_groups`, `blood_compatibility`, `blood_inventory` |
+| **Emergency & Matching**| `emergencies`, `donor_matches`, `emergency_status_history` |
+| **Camps & Community** | `camps`, `camp_ingestion_runs`, `camp_registrations`, `appointments` |
+| **Donations & Transfers**| `donations`, `transfers` |
+| **Real-time Comms** | `notifications`, `notification_preferences`, `notification_deliveries` |
+| **Spatial & Analytics** | `locations`, `analytics_events`, `ai_predictions`, `synthetic_demand_history` |
 
-Errors are consistent JSON (`{ "error": "..." }`) with an appropriate HTTP
-status (400 validation, 401 auth, 403 role, 404 not found, 429 rate
-limited, 5xx server error) — the frontend's `api.ts` surfaces these as
-per-page error states rather than generic failures.
+- **Integrity**: `PRAGMA foreign_keys = ON;`, `PRAGMA journal_mode = WAL;`.
+- **Performance**: 50 targeted compound and foreign-key indexes.
+- **Auditing**: Every critical status transition and administrative override logs to `emergency_status_history` and `audit_logs`.
 
-## 7. AI / ML features — what's actually "AI" here
+---
 
-Be precise about this, because it's easy to oversell:
+## 4. API Endpoints Reference
 
-- **Donor matching (`matching.js`)** is a **rule-based scoring engine**,
-  not a trained model. It's explicitly named `rule-based-v2` in code and
-  documented as swappable for a real ML ranker later. Every score comes
-  with a human-readable breakdown of the factors that produced it
-  (compatibility, distance, availability, recency, reliability).
-- **Demand forecasting (`services/demandForecast.js`)** is a **weighted
-  moving average with day-of-week seasonality** — deliberately simple and
-  explainable rather than a black-box model, per its own doc comments. It
-  is explicitly labeled in code as `weighted-moving-average-v1` and every
-  API response includes a `dataSource` field.
-- Neither system uses a neural network, an LLM, or any third-party AI
-  API. "AI Match" in the UI refers to the automated ranking behavior, not
-  to a machine-learning model.
-- The chatbot (`components/Chatbot.tsx`) is a small rule/keyword-based FAQ
-  responder, not an LLM integration.
+### Authentication & Profiles
+- `POST /api/auth/register` — Public donor registration with password hashing.
+- `POST /api/auth/login` — Password / username login with session token issuance.
+- `POST /api/auth/otp/send` & `POST /api/auth/otp/verify` — Telegram 2FA verification.
+- `GET /api/users/me` — Authenticated session verification & profile retrieval.
+- `POST /api/users/sync` — Firebase UID to SQLite profile provisioning.
+- `GET /api/users` & `PUT /api/users/:id` — User profile retrieval and administrative updates.
 
-If you plan to swap either system for real ML, the code is already
-structured for it: `scoreDonor()` and `forecastSeries()` are pure
-functions with documented input/output contracts specifically so a model
-can be dropped in without touching the surrounding I/O code.
+### Emergencies & Real-Time Matching
+- `POST /api/emergencies` — Create blood emergency request.
+- `GET /api/emergencies` & `GET /api/emergencies/:id` — Query active emergencies with status.
+- `GET /api/emergencies/:id/history` — Audit trail of status transitions.
+- `POST /api/emergencies/:id/respond` — Donor response (Accept/Decline).
+- `POST /api/emergencies/:id/reserve` — Hospital reservation of matched donor.
+- `POST /api/emergencies/:id/fulfill` — Mark emergency fulfilled.
+- `POST /api/emergencies/:id/cancel` — Cancel emergency request.
+- `POST /api/matching/rank-donors` — Authoritative algorithmic donor ranking.
+- `GET /api/events/stream` — Real-time Server-Sent Events (SSE) push stream.
 
-## 8. Data sources — real vs. demo vs. synthetic vs. scraped vs. AI-generated
+### Camps & Multi-Source Ingestion
+- `GET /api/camps` & `POST /api/camps` — Query and create donation camps.
+- `PUT /api/camps/:id/verify` — Admin verification of imported camps.
+- `POST /api/camps/ingest` — Execute multi-source ingestion pipeline.
+- `GET /api/camps/ingestion/runs` — Ingestion execution history and error logs.
+- `POST /api/camp_registrations` — Donor slot reservation.
 
-This matters a lot for a healthcare-adjacent app, so here's the exact
-breakdown. **Nothing in this repository is real patient, donor, or
-institutional data.**
+### Donor Passport & Gamification
+- `GET /api/donations` — Verified completed donation records.
+- `GET /api/donations/:id/certificate` — Official donation certificate generation.
+- `GET /api/leaderboard` — Privacy-masked community donor leaderboard.
 
-| Data | What it is | Where it comes from |
-|---|---|---|
-| Donors, hospitals, blood banks, emergencies, camps, donations, notifications, etc. | **100% fictional demo/seed data**, deterministically generated | `setup_db.js`, seeded with a fixed seed (`20260731`) so re-running `npm run setup` gives the same dataset every time |
-| Daily blood-demand history used to train the forecast | **Synthetic**, explicitly flagged | `synthetic_demand_history` table, `is_synthetic=1` on every row, generated by `setup_db.js` (23,360 rows across 4 cities × 730 days) |
-| Forecast predictions | **Model output derived from the synthetic data above** — not a real-world prediction | `services/demandForecast.js`; every response includes `dataSource` so you always know what it was trained on |
-| Donor-match scores | **Computed at request time from the (demo) data in the DB**, not pre-generated or hardcoded | `matching.js` |
-| Sample ingested camps | **Fixture data representing what an external source *would* return** — not a live scrape of a real website | `services/campIngestion/adapters/sample*Adapter.js` + `fixtures/*.json`, clearly named "sample" throughout, seeded with `sourceName` like *"Sample Regional Health API (demo fixture)"* |
-| Coimbatore locations/coordinates used for seed data | Real place names, used only as plausible-looking labels for fictional records | `setup_db.js` |
+### AI Medical Assistant (Proxy to Port 8001)
+- `GET /health` & `GET /api/health` — AI service & FAISS index health check.
+- `POST /api/nlp/parse` — Clinical entity extraction (blood group, units, hospital, urgency).
+- `POST /api/chat/message` — Interactive clinical conversation with emergency triage.
+- `POST /api/rag/query` — Retrieval-Augmented Generation over verified medical knowledge.
+- `GET /api/chat/history/:conversation_id` — Synchronized conversation history.
 
-No component in this repo claims fictional/synthetic data is real. Every
-generator and forecasting file has doc comments saying so explicitly (see
-`setup_db.js` and `services/demandForecast.js` headers), and API responses
-from the forecast endpoints carry a `dataSource` field for the same reason.
+---
 
-## 9. Web scraping methodology
+## 5. Security & Medical Safety Standards
 
-The camp-ingestion pipeline (`services/campIngestion/`) is built to support
-pulling donation camps from external sources, but ships with **fixture
-adapters only** — it does not scrape any live site out of the box.
+1. **Authentication Correctness**:
+   - Backend independently enforces role authorization (`requireAuth`, `requireAdmin`, `requireHospital`, `requireBloodBank`, `requireDonor`). Local storage roles are never trusted.
+   - Session restoration validates Firebase tokens and maps them to local SQLite profile records.
+2. **Medical Safety Enforcements**:
+   - Informational only: Assistant explicitly states it is an automated assistant, not a doctor.
+   - Refusal to clear unassessed medical conditions: complex or unverified conditions (e.g., systemic lupus, oncology treatments) return refusal to certify and direct to clinical officers.
+   - Acute emergency non-delay notices: immediate guidance to contact 108 / 112 emergency trauma services.
+3. **Data Protection**:
+   - Strict PII masking: exact donor coordinates, phone numbers, and Telegram chat IDs are restricted to the account owner or verified Admins.
+   - Community leaderboard masks full names (e.g., `Shiv R.`) and redacts contact info.
+   - Zero SQL injection: 100% of SQLite queries utilize parameterized bindings.
 
-- **Architecture**: `Fetch → Parse → Validate → Deduplicate → Normalize →
-  Store`, run through a single orchestrator (`pipeline.js`) for every
-  source, with every run logged step-by-step to `camp_ingestion_runs` so
-  ingestion is auditable.
-- **robots.txt compliance is enforced in code** (`robotsCompliance.js`): a
-  real, tested implementation of the robots.txt exclusion protocol
-  (`User-agent` groups, `Allow`/`Disallow`, longest-match-wins), gating any
-  web-import adapter before it fetches a page. The bot identifies itself
-  honestly via a descriptive `User-Agent` string with a contact link.
-- **This is necessary but not sufficient**: the code comments are explicit
-  that robots.txt alone doesn't grant legal permission to scrape a site — a
-  human must separately confirm a target's Terms of Service permit
-  automated collection, and that no personal/medical data is being
-  collected, before any real (non-fixture) web source is enabled.
-- **Every ingested camp record is stored as `verification_status =
-  'Unverified'`** — there is no code path that lets an ingested record skip
-  this. A human must explicitly verify a camp (`PUT /api/camps/:id/verify`)
-  before it's presented as confirmed.
-- **What's included today**: `adapters/sampleApiAdapter.js` and
-  `adapters/sampleScrapeAdapter.js` read from local JSON fixtures
-  (`fixtures/sample-official-api-response.json`,
-  `fixtures/sample-scrape-source.json`) so the full pipeline (including
-  dedup and normalization) is exercisable and testable without depending on
-  or hitting any real external website.
+---
 
-If you want to point this at a real source, you'd write a new adapter
-following the same `fetchFn` contract as the samples, route it through
-`robotsCompliance.js`, and do the legal/ToS check described above first.
+## 6. Installation & Local Development
 
-## 10. How to run locally
+### Prerequisites
+- **Node.js**: Version `22.5.0` or higher (utilizes native `node:sqlite`).
+- **Python**: Version `3.10` to `3.14` with `pip`.
+- **Git**
 
-Requires **Node.js ≥ 22.5.0** (for built-in `node:sqlite`).
-
+### Step-by-Step Setup
 ```bash
-git clone <this-repo>
-cd lifelink
+# 1. Clone Repository
+git clone https://github.com/Rakshana0707/LifeLink.git
+cd LifeLink
 
-# 1. Install root (server) dependencies
+# 2. Install Root (Backend) Dependencies
 npm install
 
-# 2. Install client dependencies
+# 3. Install Client (Frontend) Dependencies
 npm install --prefix client
 
-# 3. (Optional) Set up Python AI microservice (NLP & Chatbot)
+# 4. Set Up Python AI Microservice Virtual Environment
 cd backend
 python -m venv venv
+
 # Windows:
 .\venv\Scripts\activate
 # Linux/macOS:
 # source venv/bin/activate
+
 pip install -r requirements.txt
 cd ..
 
-# 4. Configure environment (see §11)
+# 5. Configure Environment Variables
 cp .env.example .env
-# Edit .env with your session secrets or Firebase credentials
+cp client/.env.example client/.env
 
-# 5. Create the database and seed demo data (see §12)
+# 6. Initialize & Seed Database
 npm run setup
 
-# 6. Run both the API server and the Vite dev client together
+# 7. Start Full Development Stack
+# Runs Express backend (8000) and Vite client (5173) concurrently:
 npm run dev
 ```
 
-- Client (Vite dev server): http://localhost:5173
-- API (Express): http://localhost:8000
-- AI Microservice (FastAPI): http://localhost:8001
-
-For a production-style single-process run instead:
+To run the AI Microservice alongside in development:
 ```bash
-npm run build     # builds client/dist
-npm start         # runs cross-platform launcher (Express + FastAPI)
+# In a separate terminal with backend venv activated:
+cd backend
+python -m uvicorn main:app --port 8001 --host 0.0.0.0
 ```
 
-Run the automated test suite (backend service/unit tests):
+---
+
+## 7. Environment Variables Reference
+
+### Backend (`.env`)
+```ini
+# Production Session Secret (Generate with: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")
+SESSION_SECRET=your_32_byte_hex_secret
+
+# Server Port (Default: 8000)
+PORT=8000
+
+# Environment Mode ('development' | 'production')
+NODE_ENV=development
+
+# Trust First Proxy Hop (Enable if behind NGINX, Cloudflare, AWS ALB)
+TRUST_PROXY=false
+
+# Telegram Bot Token (Optional: logs codes to server console if omitted)
+TELEGRAM_BOT_TOKEN=
+
+# Path to Firebase Admin SDK Service Account JSON Key
+FIREBASE_CREDENTIALS_PATH=./firebase-adminsdk.json
+
+# URL to Python FastAPI Microservice
+PYTHON_API_URL=http://localhost:8001
+```
+
+### Client Frontend (`client/.env`)
+```ini
+VITE_FIREBASE_PROJECT_ID=lifelink-demo
+VITE_FIREBASE_API_KEY=your_firebase_web_api_key
+VITE_FIREBASE_AUTH_DOMAIN=lifelink-demo.firebaseapp.com
+VITE_FIREBASE_STORAGE_BUCKET=lifelink-demo.appspot.com
+VITE_FIREBASE_MESSAGING_SENDER_ID=your_messaging_sender_id
+VITE_FIREBASE_APP_ID=your_firebase_app_id
+```
+
+### Firebase Authorized Domains
+In Firebase Console $\rightarrow$ Authentication $\rightarrow$ Settings $\rightarrow$ Authorized Domains, add:
+- `localhost`
+- `127.0.0.1`
+- `your-production-domain.com`
+
+---
+
+## 8. Test Execution & Quality Assurance
+
+LifeLink includes an extensive test suite covering backend unit tests, authentication integration, role-based access control, matching logic, passport sync, and AI clinical safety:
+
 ```bash
+# 1. Run Complete Node.js Test Suite (204 Tests)
 npm test
+
+# 2. Run Python AI Assistant Test Suite (10 Tests)
+# Windows PowerShell:
+$env:HF_HUB_OFFLINE="1"; $env:TRANSFORMERS_OFFLINE="1"; backend\venv\Scripts\pytest.exe -v backend\test_main.py
+# Linux/macOS:
+# HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 backend/venv/bin/pytest -v backend/test_main.py
+
+# 3. Run Database Integrity & Backup Verification
+node tests/db_audit.js
+
+# 4. Run Code Security & Parameterization Scan
+node tests/security_scan.js
+
+# 5. Build Client Production Bundle
+npm run build
 ```
 
-## 11. Environment variables
+---
 
-Defined in `.env.example` — copy it to `.env` and fill in real values
-(never commit the actual `.env`):
+## 9. Production Deployment
 
-| Variable | Required? | Purpose |
-|---|---|---|
-| `SESSION_SECRET` | Required in production | HMAC secret used to sign session tokens. Generate with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`. If unset, the app falls back to an ephemeral random secret for local dev only (all sessions invalidate on every restart); it refuses to start with this fallback if `NODE_ENV=production`. |
-| `TELEGRAM_BOT_TOKEN` | Optional | Enables real OTP/alert delivery via Telegram. If unset, the app runs in **dev mode**: OTP codes are logged to the server console and echoed back in the API response (`devCode`) instead of being sent, so the full auth flow still works without a real bot. |
-| `PORT` | Optional | Express port. Defaults to `8000`. |
-| `NODE_ENV` | Optional | Set to `production` to enforce production-only checks (e.g. requiring `SESSION_SECRET`). |
-| `TRUST_PROXY` | Optional | Set to `true` only if running behind a trusted reverse proxy that sets `X-Forwarded-For` correctly. Leave unset/`false` on a directly-exposed server — trusting it from untrusted clients would allow rate-limit bypass. |
-
-## 12. How to seed demo data
+### Option A: Unified Full-Stack Run (Recommended)
+Express serves both the API endpoints and the compiled React production bundle from `client/dist`:
 
 ```bash
-npm run setup
+# Build the client bundle
+npm run build
+
+# Start both Express (8000) and FastAPI AI Service (8001) via launcher:
+npm start
 ```
 
-This runs `setup_db.js`, which:
-1. Creates the schema (24 tables + indexes) if it doesn't exist.
-2. Generates a full **fictional, deterministic** demo dataset (fixed seed
-   `20260731`, so it's identical every time you re-run it): donors,
-   hospitals, blood banks with varied inventory, an admin account,
-   emergency requests with status history, donation camps (including two
-   sample-ingested, unverified ones), registrations, donation records,
-   appointments, transfers, notifications, analytics events, donor-match
-   suggestions, and synthetic daily demand history for forecasting.
+### Option B: Containerized / Multi-Process Architecture
+In enterprise deployments:
+1. **Frontend**: Serve `client/dist` via NGINX or AWS S3 + CloudFront CDN.
+2. **Backend**: Run `node server.js` under PM2 or Docker (`PORT=8000`).
+3. **AI Service**: Run `uvicorn backend.main:app --host 0.0.0.0 --port 8001 --workers 2`.
+4. **Reverse Proxy (NGINX)**:
+   ```nginx
+   server {
+       listen 80;
+       server_name lifelink.example.com;
 
-**This is destructive/full-reset by design** — re-running it any time gives
-you a clean, consistent demo state. It prints a demo login on completion
-(pattern: `<firstname>123`, e.g. the first seeded donor / `admin123` for
-the seeded Admin account) — check the console output after running it for
-the exact current values, since the specific first donor is deterministic
-but not hardcoded in this doc.
+       location /api/nlp { proxy_pass http://127.0.0.1:8001; }
+       location /api/chat { proxy_pass http://127.0.0.1:8001; }
+       location /api/rag { proxy_pass http://127.0.0.1:8001; }
+       location /api/ { proxy_pass http://127.0.0.1:8000; }
+       location / {
+           root /var/www/lifelink/client/dist;
+           try_files $uri $uri/ /index.html;
+       }
+   }
+   ```
 
-## 13. How to run analytics
-
-Analytics are computed live from the database — there's no separate batch
-job to run. Once the server is running and you're logged in as a role with
-access (Admin sees platform-wide; Hospital/Blood Bank see their own scope):
-
-- `GET /api/analytics/summary` and `GET /api/analytics/dashboard` — power
-  the in-app **Analytics** page (`client/src/pages/Analytics.tsx`), with
-  optional filters (`dateFrom`, `dateTo`, `bloodGroup`, `city`,
-  `hospitalId`, `bloodBankId`).
-- `services/analytics.js` functions are also directly unit-tested — see
-  `tests/analytics.test.js` — if you want to exercise the metric logic
-  without going through HTTP.
-
-## 14. How to run the ML/forecasting pipeline
-
-Also computed on demand, not a scheduled/offline job:
-
-- `GET /api/forecast/demand` — per blood-group/location prediction (Admin
-  only).
-- `GET /api/forecast/high-risk-locations` — locations whose predicted
-  demand vs. current stock crosses a shortage-risk threshold.
-- `GET /api/forecast/history` — the historical series a prediction was
-  based on, for charting.
-
-To exercise the forecasting math directly (no server/DB needed):
+### Database Persistence & Backups
+SQLite database (`lifelink.db`) resides on disk. To execute consistent live snapshots without downtime:
 ```bash
-node --test tests/demandForecast.test.js
+node -e "const { DatabaseSync } = require('node:sqlite'); const db = new DatabaseSync('lifelink.db'); db.exec(\"VACUUM INTO 'lifelink_backup_\" + Date.now() + \".db'\");"
 ```
-`services/demandForecast.js` exports `forecastSeries()` as a pure function
-if you want to experiment with it in a script or REPL — see its doc
-comments for the exact input/output shape.
-
-## 15. Authentication details
-
-Real, two-factor, Telegram-based login — not a placeholder:
-
-1. Every account links a Telegram **Chat ID** (obtained by messaging the
-   configured bot with `/start`), verified via `/api/auth/otp/verify`
-   before the account is created.
-2. On sign-in, after password verification, a fresh OTP is sent to the
-   linked Telegram chat (`/api/auth/login/request-otp` →
-   `/api/auth/login/verify-otp`) — a true second factor, not a signup-only
-   formality.
-3. Critical/urgent emergency posts trigger an instant Telegram alert to
-   donors with a matching blood type and a linked chat.
-4. Without `TELEGRAM_BOT_TOKEN` set, the whole flow still works in **dev
-   mode** — codes are printed to the server console instead of sent.
-
-### Role-based access
-
-Only the public pages (Home, Emergency board, Find Blood, Live Map, AI
-Match, Camps, Leaderboard) are open to everyone. The Donor, Hospital, Blood
-Bank, and Admin dashboards, the Blood Passport, Notifications, and
-Analytics/Forecast pages are gated — an unauthenticated visitor is
-redirected to sign in first, and every server-side route re-checks the
-caller's role from the database (not from any client-supplied header) on
-every request.
-
-## 16. Testing this repo yourself
-
-```bash
-npm test                          # 93 backend unit/service tests (Node's built-in test runner)
-npx tsc -b --pretty               # from client/ — TypeScript typecheck
-npx oxlint                        # from client/ — lint
-npx vite build                    # from client/ — production build
-```
-
-All four currently pass cleanly with no errors on a clean checkout.

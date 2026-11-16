@@ -46,6 +46,8 @@ const PYTHON_API_URL = process.env.PYTHON_API_URL || 'http://localhost:8001';
 app.use(['/api/nlp', '/api/chat', '/api/rag'], createProxyMiddleware({
   target: PYTHON_API_URL,
   changeOrigin: true,
+  proxyTimeout: 30000,
+  timeout: 30000,
   on: {
     error: (err, req, res) => {
       console.error('[Proxy Error]', err.message);
