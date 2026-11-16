@@ -11,6 +11,10 @@ export interface User {
   isNewRegistration: boolean;
   pendingUpdate: { name: string; location: string; bloodType: string } | null;
   activeCampRegistration: { campTitle: string; verificationId: string; date: string; slot: string } | null;
+  availabilityStatus?: 'Active' | 'On Duty' | 'Inactive';
+  lastDonationDate?: string | null;
+  nextEligibleDate?: string | null;
+  totalUnitsDonated?: number;
   licenseNumber?: string;
   accreditationDoc?: string;
   lat?: number | null;
@@ -153,9 +157,48 @@ export interface Donation {
   hospital: string;
   time: string;
   status: string;
+  units?: number;
   details: string;
   donationDate: string | null;
+  certificateId?: string | null;
   channel: 'camp' | 'blood_bank' | 'hospital' | 'unknown';
+}
+
+export interface DonationCertificate {
+  certificateId: string;
+  donationId: string;
+  donorId: string;
+  donorName: string;
+  maskedPassportId: string;
+  bloodType: string;
+  units: number;
+  donationDate: string;
+  facility: string;
+  verificationSeal: string;
+  verificationCode: string;
+  issuedAt: string;
+  disclaimer: string;
+  livesSavedEstimate: number;
+}
+
+export interface LeaderboardEntry {
+  id: string;
+  rank: number;
+  name: string;
+  maskedName: string;
+  bloodType: string;
+  location: string;
+  donations: number;
+  xp: number;
+  level: number;
+  badgeCount: number;
+  isCurrent: boolean;
+}
+
+export interface LeaderboardResponse {
+  leaderboard: LeaderboardEntry[];
+  totalDonors: number;
+  currentUserRank: LeaderboardEntry | null;
 }
 
 export type NotificationUrgency = 'Critical' | 'Urgent' | 'Normal' | 'Info';
@@ -790,6 +833,16 @@ export const api = {
   // Donations APIs (real donation history — replaces any hardcoded history)
   getDonations: (donorId?: string): Promise<Donation[]> =>
     authedFetch(`/api/donations${donorId ? `?donor_id=${donorId}` : ''}`).then(handleResponse),
+
+  getDonationCertificate: (donationId: string): Promise<DonationCertificate> =>
+    authedFetch(`/api/donations/${donationId}/certificate`).then(handleResponse),
+
+  completeDonation: (donationId: string): Promise<{ success: boolean }> =>
+    authedFetch(`/api/donations/${donationId}/complete`, { method: 'POST' }).then(handleResponse),
+
+  // Privacy-Safe Community Leaderboard API
+  getLeaderboard: (): Promise<LeaderboardResponse> =>
+    authedFetch('/api/leaderboard').then(handleResponse),
 
   // Notifications APIs
   getNotifications: (userId: string, opts?: { unreadOnly?: boolean }): Promise<Notification[]> =>

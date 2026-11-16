@@ -143,6 +143,19 @@ const requireAuth = async (req, res, next) => {
   next();
 };
 
+// Optional authentication: extracts caller if valid session/token present, but does not block anonymous callers.
+const optionalAuth = async (req, res, next) => {
+  try {
+    const actor = await getActorFromRequest(req, db);
+    if (actor && actor.status !== 'Suspended' && actor.status !== 'Disabled') {
+      req.actor = actor;
+    }
+  } catch (e) {
+    // optional auth ignores extraction errors
+  }
+  next();
+};
+
 // Convenience shorthand guards
 const requireAdmin = requireRole('Admin');
 const requireHospital = requireRole('Hospital', 'Admin');
@@ -286,9 +299,41 @@ const OTP_MAX_ATTEMPTS = 5;
 
 const buildUserResponse = (u) => {
   let bloodType = 'Multiple';
+  let availabilityStatus = 'Active';
+  let lastDonationDate = null;
+  let nextEligibleDate = null;
+  let totalUnits = 0;
+  let effectiveDonations = u.total_donations || 0;
+
   if (u.role === 'Donor') {
-    const dp = db.prepare('SELECT blood_group_id FROM donor_profiles WHERE user_id = ?').get(u.id);
-    if (dp) bloodType = typeByGroupId[dp.blood_group_id] || 'O+';
+    const dp = db.prepare('SELECT blood_group_id, availability_status, last_donation_date, next_eligible_date FROM donor_profiles WHERE user_id = ?').get(u.id);
+    if (dp) {
+      bloodType = typeByGroupId[dp.blood_group_id] || 'O+';
+      availabilityStatus = dp.availability_status || 'Active';
+      lastDonationDate = dp.last_donation_date || null;
+      nextEligibleDate = dp.next_eligible_date || null;
+    }
+
+    // Check verified completed donations from donations table
+    const stats = db.prepare(`
+      SELECT COUNT(*) as count,
+             COALESCE(SUM(CASE WHEN units IS NOT NULL AND units > 0 THEN units ELSE 1 END), 0) as units,
+             MAX(donation_date) as latest_date
+      FROM donations WHERE donor_id = ? AND status = 'Completed'
+    `).get(u.id);
+
+    if (stats) {
+      if (stats.count > effectiveDonations) {
+        effectiveDonations = stats.count;
+      }
+      totalUnits = stats.units || effectiveDonations;
+      if (!lastDonationDate && stats.latest_date) {
+        lastDonationDate = stats.latest_date;
+        const d = new Date(stats.latest_date);
+        d.setDate(d.getDate() + 90);
+        nextEligibleDate = d.toISOString().split('T')[0];
+      }
+    }
   }
 
   let activeCampRegistration = null;
@@ -319,7 +364,11 @@ const buildUserResponse = (u) => {
     location: locationLabel(u.location_id),
     status: u.status,
     passportId: u.passport_id,
-    donations: u.total_donations,
+    donations: effectiveDonations,
+    totalUnitsDonated: u.role === 'Donor' ? totalUnits : undefined,
+    availabilityStatus: u.role === 'Donor' ? availabilityStatus : undefined,
+    lastDonationDate: u.role === 'Donor' ? lastDonationDate : undefined,
+    nextEligibleDate: u.role === 'Donor' ? nextEligibleDate : undefined,
     xp: u.xp,
     isNewRegistration: !!u.is_new_registration,
     pendingUpdate: u.pending_update ? JSON.parse(u.pending_update) : null,
@@ -591,7 +640,7 @@ app.put('/api/users/:id', requireAuth, (req, res) => {
     const {
       name, location, bloodType, status, donations, xp, isNewRegistration, pendingUpdate,
       approveUpdate, rejectUpdate, approveOnboarding, denyOnboarding, activeCampRegistration,
-      lat, lng, telegramChatId, phone
+      lat, lng, telegramChatId, phone, availabilityStatus
     } = req.body;
 
     // Admin-only operations: onboarding decisions and profile-update approvals
@@ -686,7 +735,14 @@ app.put('/api/users/:id', requireAuth, (req, res) => {
       // (Creation of new registrations is handled via POST /api/camp_registrations)
     }
 
-    if (fields.length === 0 && bloodType === undefined && activeCampRegistration === undefined) {
+    if (availabilityStatus !== undefined) {
+      const validStatuses = ['Active', 'On Duty', 'Inactive'];
+      if (validStatuses.includes(availabilityStatus)) {
+        db.prepare("UPDATE donor_profiles SET availability_status = ?, updated_at = datetime('now') WHERE user_id = ?").run(availabilityStatus, id);
+      }
+    }
+
+    if (fields.length === 0 && bloodType === undefined && activeCampRegistration === undefined && availabilityStatus === undefined) {
       return res.status(400).json({ error: 'No fields to update' });
     }
     res.json({ success: true });
@@ -1824,6 +1880,8 @@ const buildDonationResponse = (d) => {
   if (d.camp_id) channel = 'camp';
   else if (d.blood_bank_id) channel = 'blood_bank';
   else if (d.hospital_id) channel = 'hospital';
+  const units = d.units && d.units > 0 ? d.units : 1;
+  const isCompleted = d.status === 'Completed';
   return {
     id: d.id,
     donor: d.donor_name,
@@ -1832,8 +1890,10 @@ const buildDonationResponse = (d) => {
     hospital: d.hospital_name || d.blood_bank_name || d.camp_title || 'LifeLink',
     time: d.created_at,
     status: d.status,
+    units,
     details: d.notes,
     donationDate: d.donation_date,
+    certificateId: isCompleted ? (`LL-CERT-${d.id.toUpperCase()}`) : null,
     channel
   };
 };
@@ -1861,14 +1921,66 @@ app.get('/api/recent_donations', requireRole('Admin', 'Hospital', 'Blood Bank'),
 
 app.post('/api/recent_donations', requireRole('Admin', 'Hospital', 'Blood Bank'), (req, res) => {
   try {
-    const { id, donor, bloodType, hospital, status, details } = req.body;
+    const { id, donor, bloodType, hospital, status, details, units, donationDate } = req.body;
+    const donationId = id || ('dn' + Date.now());
     const groupIdVal = groupIdByType[bloodType] || null;
-    const donorRow = db.prepare('SELECT id FROM users WHERE name = ? AND role = \'Donor\'').get(donor);
-    const hospRow = db.prepare('SELECT id FROM users WHERE name = ? AND role = \'Hospital\'').get(hospital);
-    db.prepare(
-      `INSERT INTO donations (id, donor_id, blood_group_id, hospital_id, status, notes) VALUES (?, ?, ?, ?, ?, ?)`
-    ).run(id, donorRow ? donorRow.id : null, groupIdVal, hospRow ? hospRow.id : null, status || 'Scheduled', details || null);
-    res.json({ success: true });
+    const donorRow = db.prepare("SELECT id FROM users WHERE (name = ? OR id = ?) AND role = 'Donor'").get(donor, donor);
+    const hospRow = db.prepare("SELECT id FROM users WHERE (name = ? OR id = ?) AND role IN ('Hospital', 'Blood Bank')").get(hospital, hospital);
+    const donationUnits = Number(units) > 0 ? Number(units) : 1;
+    const donationStatus = status || 'Scheduled';
+    const dateVal = donationDate || new Date().toISOString().split('T')[0];
+
+    db.exec('BEGIN');
+    try {
+      db.prepare(
+        `INSERT INTO donations (id, donor_id, blood_group_id, hospital_id, units, status, donation_date, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(donationId, donorRow ? donorRow.id : null, groupIdVal, hospRow ? hospRow.id : null, donationUnits, donationStatus, dateVal, details || null);
+
+      if (donationStatus === 'Completed' && donorRow) {
+        // Increment donor's verified total_donations and XP
+        db.prepare("UPDATE users SET total_donations = total_donations + 1, xp = xp + 200, updated_at = datetime('now') WHERE id = ?").run(donorRow.id);
+        db.prepare(
+          "UPDATE donor_profiles SET last_donation_date = ?, next_eligible_date = date(?, '+90 days'), updated_at = datetime('now') WHERE user_id = ?"
+        ).run(dateVal, dateVal, donorRow.id);
+      }
+      db.exec('COMMIT');
+      res.json({ success: true, id: donationId });
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+// Complete a donation (e.g. after blood draw at hospital or camp)
+app.post('/api/donations/:id/complete', requireRole('Admin', 'Hospital', 'Blood Bank'), (req, res) => {
+  try {
+    const { id } = req.params;
+    const donation = db.prepare('SELECT * FROM donations WHERE id = ?').get(id);
+    if (!donation) return res.status(404).json({ error: 'Donation not found' });
+    if (donation.status === 'Completed') {
+      return res.json({ success: true, message: 'Donation already completed' });
+    }
+
+    const today = new Date().toISOString().split('T')[0];
+    db.exec('BEGIN');
+    try {
+      db.prepare("UPDATE donations SET status = 'Completed', donation_date = COALESCE(donation_date, ?), updated_at = datetime('now') WHERE id = ?").run(today, id);
+      if (donation.donor_id) {
+        db.prepare("UPDATE users SET total_donations = total_donations + 1, xp = xp + 200, updated_at = datetime('now') WHERE id = ?").run(donation.donor_id);
+        db.prepare(
+          "UPDATE donor_profiles SET last_donation_date = ?, next_eligible_date = date(?, '+90 days'), updated_at = datetime('now') WHERE user_id = ?"
+        ).run(today, today, donation.donor_id);
+      }
+      db.exec('COMMIT');
+      res.json({ success: true });
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
   } catch (err) {
     sendError(res, err);
   }
@@ -1889,6 +2001,146 @@ app.get('/api/donations', requireAuth, (req, res) => {
     }
     sql += ' ORDER BY d.created_at DESC';
     res.json(db.prepare(sql).all(...params).map(buildDonationResponse));
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+// Donation Certificate Generation — restricted to verified Completed donations only
+app.get('/api/donations/:id/certificate', requireAuth, (req, res) => {
+  try {
+    const { id } = req.params;
+    const donation = db.prepare(`
+      ${donationJoinSql}
+      WHERE d.id = ?
+    `).get(id);
+
+    if (!donation) {
+      return res.status(404).json({ error: 'Donation record not found' });
+    }
+
+    const isOwner = req.actor && req.actor.id === donation.donor_id;
+    const isPrivileged = req.actor && ['Admin', 'Hospital', 'Blood Bank'].includes(req.actor.role);
+    if (!isOwner && !isPrivileged) {
+      return res.status(403).json({ error: 'You are not authorized to view this donation certificate' });
+    }
+
+    if (donation.status !== 'Completed') {
+      return res.status(400).json({ 
+        error: `Certificates can only be issued for verified completed donations. Current status: ${donation.status}` 
+      });
+    }
+
+    const donorUser = db.prepare('SELECT * FROM users WHERE id = ?').get(donation.donor_id);
+    const donorName = donation.donor_name || donorUser?.name || 'Verified Donor';
+    const rawPid = donorUser?.passport_id || 'LL-DONOR';
+    const maskedPid = rawPid.length > 6 ? `${rawPid.slice(0, 3)}***${rawPid.slice(-3)}` : rawPid;
+    const bloodType = typeByGroupId[donation.blood_group_id] || 'O+';
+    const facility = donation.hospital_name || donation.blood_bank_name || donation.camp_title || 'LifeLink Certified Center';
+    const units = donation.units && donation.units > 0 ? donation.units : 1;
+    const donationDate = donation.donation_date || donation.created_at?.split('T')[0] || donation.created_at?.split(' ')[0] || new Date().toISOString().split('T')[0];
+
+    const crypto = require('crypto');
+    const verificationCode = crypto
+      .createHash('sha256')
+      .update(`${donation.id}:${donation.donor_id}:${donationDate}:${units}:LIFELINK-OFFICIAL-VERIFIED`)
+      .digest('hex')
+      .substring(0, 16)
+      .toUpperCase();
+
+    res.json({
+      certificateId: `LL-CERT-${donation.id.toUpperCase()}`,
+      donationId: donation.id,
+      donorId: donation.donor_id,
+      donorName,
+      maskedPassportId: maskedPid,
+      bloodType,
+      units,
+      donationDate,
+      facility,
+      verificationSeal: 'LIFELINK-OFFICIAL-VERIFIED',
+      verificationCode,
+      issuedAt: new Date().toISOString(),
+      disclaimer: 'This certificate confirms a verified voluntary blood donation through the LifeLink Healthcare Network.',
+      livesSavedEstimate: units * 3
+    });
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+/* ==========================================
+   LEADERBOARD API (Privacy-Safe Community Rankings)
+   ========================================== */
+
+const maskDonorLeaderboardName = (name) => {
+  if (!name) return 'Anonymous Donor';
+  const parts = name.trim().split(/\s+/);
+  if (parts.length === 1) {
+    return parts[0].length > 2 ? parts[0].slice(0, 2) + '***' : parts[0];
+  }
+  return `${parts[0]} ${parts[parts.length - 1][0].toUpperCase()}.`;
+};
+
+app.get('/api/leaderboard', optionalAuth, (req, res) => {
+  try {
+    const rows = db.prepare(`
+      SELECT u.id, u.name, u.role, u.total_donations, u.xp, u.location_id,
+             dp.blood_group_id, dp.availability_status,
+             (SELECT COUNT(*) FROM donations d WHERE d.donor_id = u.id AND d.status = 'Completed') as verified_donations,
+             (SELECT COUNT(*) FROM donor_matches dm WHERE dm.donor_id = u.id AND dm.status = 'Donated') as emergency_responses
+      FROM users u
+      LEFT JOIN donor_profiles dp ON dp.user_id = u.id
+      WHERE u.role = 'Donor' AND u.status = 'Active'
+      ORDER BY u.xp DESC, u.total_donations DESC, u.created_at ASC
+    `).all();
+
+    const callerId = req.actor?.id;
+    let currentUserRank = null;
+
+    const ranked = rows.map((d, index) => {
+      const rank = index + 1;
+      const isCaller = callerId && callerId === d.id;
+      const completedCount = Math.max(d.total_donations || 0, d.verified_donations || 0);
+      const emergencyCount = d.emergency_responses || 0;
+
+      let badgeCount = 0;
+      if (completedCount >= 1) badgeCount++;
+      if (completedCount >= 3) badgeCount++;
+      if (completedCount >= 5) badgeCount++;
+      if (completedCount >= 10) badgeCount++;
+      if (completedCount >= 25) badgeCount++;
+      if (emergencyCount >= 1) badgeCount++;
+
+      const bloodType = typeByGroupId[d.blood_group_id] || 'O+';
+      const cityLoc = locationLabel(d.location_id);
+      const cityOnly = cityLoc ? cityLoc.split(',')[0].trim() : 'Tamil Nadu';
+
+      const entry = {
+        id: isCaller ? d.id : `donor_${rank}`,
+        rank,
+        name: isCaller ? d.name : maskDonorLeaderboardName(d.name),
+        maskedName: maskDonorLeaderboardName(d.name),
+        bloodType,
+        location: cityOnly,
+        donations: completedCount,
+        xp: d.xp || 0,
+        level: Math.floor((d.xp || 0) / 300) || 1,
+        badgeCount,
+        isCurrent: !!isCaller
+      };
+
+      if (isCaller) {
+        currentUserRank = entry;
+      }
+      return entry;
+    });
+
+    res.json({
+      leaderboard: ranked.slice(0, 50),
+      totalDonors: rows.length,
+      currentUserRank: currentUserRank || null
+    });
   } catch (err) {
     sendError(res, err);
   }
