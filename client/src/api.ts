@@ -448,16 +448,23 @@ const handleResponse = async (res: Response) => {
 // which the server trusted with no proof of authentication.
 let _sessionToken: string | null = null;
 try {
-  _sessionToken = localStorage.getItem('lifelink_token');
+  _sessionToken = localStorage.getItem('lifelink_token') || sessionStorage.getItem('lifelink_token');
 } catch {}
 
-export const setApiActor = (token: string | null) => {
+export const setApiActor = (token: string | null, remember: boolean = true) => {
   _sessionToken = token;
   try {
     if (token) {
-      localStorage.setItem('lifelink_token', token);
+      if (remember) {
+        localStorage.setItem('lifelink_token', token);
+        sessionStorage.removeItem('lifelink_token');
+      } else {
+        sessionStorage.setItem('lifelink_token', token);
+        localStorage.removeItem('lifelink_token');
+      }
     } else {
       localStorage.removeItem('lifelink_token');
+      sessionStorage.removeItem('lifelink_token');
     }
   } catch {}
 };

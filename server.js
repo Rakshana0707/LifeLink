@@ -369,11 +369,19 @@ app.post('/api/users/sync', async (req, res) => {
     const email = decodedToken.email || req.body.email || null;
     const name = decodedToken.name || req.body.name || (email ? email.split('@')[0] : 'LifeLink User');
     const requestedRole = req.body.role;
+    if (requestedRole === 'Admin') {
+      return res.status(403).json({ error: 'Registration as Admin is strictly prohibited.' });
+    }
     const role = (requestedRole && ['Donor', 'Hospital', 'Blood Bank', 'Patient'].includes(requestedRole))
       ? (requestedRole === 'Patient' ? 'Donor' : requestedRole)
       : 'Donor';
     const bloodType = req.body.bloodType || 'O+';
     const location = req.body.location || 'Coimbatore';
+    const phone = req.body.phone || null;
+    const licenseNumber = req.body.licenseNumber || null;
+    const accreditationDoc = req.body.accreditationDoc || null;
+    const finalStatus = (role === 'Hospital' || role === 'Blood Bank') ? 'Pending Verification' : 'Active';
+    const newReg = req.body.isNewRegistration ? 1 : 0;
 
     // Check if user already exists by UID, firebase_uid, or email
     let existing = null;
@@ -404,16 +412,16 @@ app.post('/api/users/sync', async (req, res) => {
     db.prepare(
       `INSERT INTO users (id, name, email, phone, role, password_hash, telegram_chat_id, passport_id,
                            status, is_new_registration, total_donations, xp, location_id, lat, lng, firebase_uid)
-       VALUES (?, ?, ?, NULL, ?, 'FIREBASE_AUTH_MANAGED', NULL, ?, 'Active', 0, 0, 0, ?, NULL, NULL, ?)`
-    ).run(uid, name, email, role, passportId, locationId, uid);
+       VALUES (?, ?, ?, ?, ?, 'FIREBASE_AUTH_MANAGED', NULL, ?, ?, ?, 0, 0, ?, NULL, NULL, ?)`
+    ).run(uid, name, email, phone, role, passportId, finalStatus, newReg, locationId, uid);
 
     if (role === 'Donor') {
       const groupId = groupIdByType[bloodType] || groupIdByType['O+'];
       db.prepare(`INSERT INTO donor_profiles (user_id, blood_group_id, availability_status) VALUES (?, ?, 'Active')`).run(uid, groupId);
     } else if (role === 'Hospital') {
-      db.prepare(`INSERT INTO hospital_profiles (user_id, location_id, verification_status) VALUES (?, ?, 'Pending Verification')`).run(uid, locationId);
+      db.prepare(`INSERT INTO hospital_profiles (user_id, license_number, accreditation_doc, location_id, verification_status) VALUES (?, ?, ?, ?, 'Pending Verification')`).run(uid, licenseNumber, accreditationDoc, locationId);
     } else if (role === 'Blood Bank') {
-      db.prepare(`INSERT INTO blood_bank_profiles (user_id, location_id, verification_status) VALUES (?, ?, 'Pending Verification')`).run(uid, locationId);
+      db.prepare(`INSERT INTO blood_bank_profiles (user_id, license_number, location_id, verification_status) VALUES (?, ?, ?, 'Pending Verification')`).run(uid, licenseNumber, locationId);
       Object.values(groupIdByType).forEach((gId) => {
         db.prepare('INSERT OR IGNORE INTO blood_inventory (blood_bank_id, blood_group_id, units) VALUES (?, ?, 0)').run(uid, gId);
       });
@@ -499,7 +507,9 @@ app.post('/api/users', rateLimit('register', 20, 3600000), async (req, res) => {
 
     const prefix = finalRole === 'Donor' ? 'LL' : finalRole === 'Hospital' ? 'HP' : 'BB';
     const passportId = `${prefix}-2026-CBE-${Math.floor(1000 + Math.random() * 9000)}`;
-    const finalStatus = status || (finalRole === 'Donor' ? 'Active' : 'Verified');
+    const finalStatus = (finalRole === 'Hospital' || finalRole === 'Blood Bank')
+      ? 'Pending Verification'
+      : (status || 'Active');
     const newReg = isNewRegistration ? 1 : 0;
     const initialXP = finalRole === 'Donor' ? 0 : finalRole === 'Blood Bank' ? 10000 : 5000;
     const initialDonations = finalRole === 'Donor' ? 0 : finalRole === 'Blood Bank' ? 240 : 45;
@@ -523,12 +533,12 @@ app.post('/api/users', rateLimit('register', 20, 3600000), async (req, res) => {
       db.prepare(
         `INSERT INTO hospital_profiles (user_id, license_number, accreditation_doc, location_id, verification_status)
          VALUES (?, ?, ?, ?, ?)`
-      ).run(id, licenseNumber || null, accreditationDoc || null, locationId, finalStatus === 'Verified' ? 'Verified Partner' : 'Pending Verification');
+      ).run(id, licenseNumber || null, accreditationDoc || null, locationId, 'Pending Verification');
     } else if (role === 'Blood Bank') {
       db.prepare(
         `INSERT INTO blood_bank_profiles (user_id, license_number, location_id, verification_status)
          VALUES (?, ?, ?, ?)`
-      ).run(id, licenseNumber || null, locationId, finalStatus === 'Verified' ? 'Verified Partner' : 'Pending Verification');
+      ).run(id, licenseNumber || null, locationId, 'Pending Verification');
       // Start with an empty inventory row per blood group so totals compute cleanly
       Object.values(groupIdByType).forEach((gId) => {
         db.prepare('INSERT OR IGNORE INTO blood_inventory (blood_bank_id, blood_group_id, units) VALUES (?, ?, 0)').run(id, gId);
