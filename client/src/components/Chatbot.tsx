@@ -12,7 +12,8 @@ export const Chatbot: React.FC = () => {
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       sender: 'bot',
-      text: "Hi! I'm LifeLink AI. I can answer questions about blood donation or help you create an emergency request. How can I help?",
+      text: "Hello! I'm LifeLink AI, an automated informational assistant (not a doctor). I can answer questions regarding blood donation criteria, ABO/Rh compatibility, and donation procedures, or help you broadcast an urgent emergency blood request. How can I assist you today?",
+      metadata: { type: 'greeting' }
     },
   ]);
   const [inputVal, setInputVal] = useState('');
@@ -70,11 +71,26 @@ export const Chatbot: React.FC = () => {
       });
       
       const data = await res.json();
-      setMessages((prev) => [...prev, { sender: 'bot', text: data.reply, metadata: data }]);
-    } catch (err) {
+      if (!res.ok) {
+        throw new Error(data.error || 'AI Service unavailable');
+      }
+
       setMessages((prev) => [
         ...prev,
-        { sender: 'bot', text: 'Error connecting to LifeLink AI. Please try again later.' },
+        {
+          sender: 'bot',
+          text: data.reply || 'Information received. Please consult clinical staff for medical advice.',
+          metadata: data
+        }
+      ]);
+    } catch (err: any) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          sender: 'bot',
+          text: '⚠️ LifeLink AI assistant is currently reconnecting. If you are experiencing a life-threatening medical emergency, please call 108 / 112 immediately or proceed to the Emergency tab to broadcast a request.',
+          metadata: { type: 'error_fallback' }
+        },
       ]);
     } finally {
       setIsTyping(false);
@@ -110,15 +126,17 @@ export const Chatbot: React.FC = () => {
       <div id="chat-window" className={isOpen ? 'open' : ''}>
         <div className="chat-hdr">
           <div className="chat-av">🤖</div>
-          <div>
-            <div style={{ fontSize: '13px', fontWeight: 700 }}>LifeLink AI</div>
-            <div style={{ fontSize: '11px', opacity: 0.8 }}>Powered by RAG + NLP</div>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: '13px', fontWeight: 700 }}>LifeLink AI (Assistant)</div>
+            <div style={{ fontSize: '10px', opacity: 0.85, color: '#fef08a' }}>
+              Informational Only · Emergency: Call 108/112
+            </div>
           </div>
-          <div className="chat-online" />
+          <div className="chat-online" title="Service Connected" />
           <button
             onClick={() => setIsOpen(false)}
             style={{
-              marginLeft: 'auto',
+              marginLeft: '8px',
               background: 'none',
               border: 'none',
               color: 'rgba(255, 255, 255, 0.7)',
@@ -137,41 +155,44 @@ export const Chatbot: React.FC = () => {
               key={index}
               className={`msg ${m.sender === 'user' ? 'msg-user' : 'msg-bot'}`}
             >
-              {m.text}
+              <div style={{ whiteSpace: 'pre-line' }}>{m.text}</div>
               
-              {/* Emergency Confirmation State */}
+              {/* Emergency Confirmation Box */}
               {m.metadata && m.metadata.type === 'emergency_confirm' && (
-                <div style={{ marginTop: '10px', background: 'rgba(255,255,255,0.1)', padding: '10px', borderRadius: '8px', fontSize: '12px' }}>
-                  <div style={{ fontWeight: 'bold', marginBottom: '4px', color: '#ef4444' }}>Detected Entities:</div>
-                  <div>Blood Group: <b>{m.metadata.parsed_data?.blood_group || 'Unknown'}</b></div>
-                  <div>Quantity: <b>{m.metadata.parsed_data?.quantity || 'Unknown'}</b></div>
-                  <div>Hospital: <b>{m.metadata.parsed_data?.hospital || 'Unknown'}</b></div>
-                  <div>Urgency: <b>{m.metadata.parsed_data?.urgency || 'Normal'}</b></div>
-                  <div style={{ marginTop: '5px', fontSize: '10px', opacity: 0.7 }}>Intent Confidence: {(m.metadata.confidence * 100).toFixed(1)}%</div>
+                <div style={{ marginTop: '10px', background: 'rgba(239, 68, 68, 0.15)', border: '1px solid rgba(239, 68, 68, 0.4)', padding: '10px', borderRadius: '8px', fontSize: '12px' }}>
+                  <div style={{ fontWeight: 'bold', marginBottom: '6px', color: '#fca5a5', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                    <span>🚨</span> Detected Emergency Parameters:
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px', fontSize: '11px', marginBottom: '8px' }}>
+                    <div>Blood Group: <b style={{ color: 'var(--red)' }}>{m.metadata.parsed_data?.blood_group || 'Unknown'}</b></div>
+                    <div>Units Needed: <b>{m.metadata.parsed_data?.quantity || 1}</b></div>
+                    <div style={{ gridColumn: 'span 2' }}>Hospital: <b>{m.metadata.parsed_data?.hospital || 'Certified Facility'}</b></div>
+                    <div>Urgency: <b style={{ color: '#fbbf24' }}>{m.metadata.parsed_data?.urgency || 'Critical'}</b></div>
+                    <div style={{ textAlign: 'right', opacity: 0.7 }}>Conf: {(m.metadata.confidence * 100).toFixed(0)}%</div>
+                  </div>
                   
                   <button 
                     onClick={() => handleCreateEmergency(m.metadata.parsed_data)}
                     style={{
-                      marginTop: '8px',
-                      background: '#ef4444',
+                      background: 'var(--red)',
                       color: 'white',
                       border: 'none',
-                      padding: '6px 10px',
-                      borderRadius: '4px',
+                      padding: '8px 12px',
+                      borderRadius: '6px',
                       cursor: 'pointer',
-                      fontWeight: 'bold',
-                      width: '100%'
+                      fontWeight: 700,
+                      width: '100%',
+                      fontSize: '12px'
                     }}>
-                    Proceed to Create Request
+                    🚨 Open Emergency Request Broadcast
                   </button>
                 </div>
               )}
 
               {/* RAG Source Display */}
               {m.metadata && m.metadata.type === 'rag' && m.metadata.source && m.metadata.source.length > 0 && (
-                <div style={{ marginTop: '8px', fontSize: '10px', color: 'var(--gr)', borderTop: '1px solid rgba(0,0,0,0.05)', paddingTop: '4px' }}>
-                  <b>Sources:</b> {Array.from(new Set((m.metadata.source as any[]).map((s) => s.filename))).join(', ')}
-                  <span style={{ float: 'right' }}>Conf: {(m.metadata.confidence * 100).toFixed(1)}%</span>
+                <div style={{ marginTop: '8px', fontSize: '10px', color: 'var(--gr)', borderTop: '1px solid rgba(255,255,255,0.06)', paddingTop: '4px' }}>
+                  <b>Verified Sources:</b> {Array.from(new Set((m.metadata.source as any[]).map((s) => s.filename))).join(', ')}
                 </div>
               )}
             </div>
@@ -186,13 +207,13 @@ export const Chatbot: React.FC = () => {
         </div>
 
         <div className="chat-qr">
-          <button className="chat-qr-btn" onClick={() => handleQuickReply('Am I eligible to donate?')}>
+          <button className="chat-qr-btn" onClick={() => handleQuickReply('What are the eligibility requirements to donate blood?')}>
             Eligibility?
           </button>
-          <button className="chat-qr-btn" onClick={() => handleQuickReply('How does donation work?')}>
-            Process
+          <button className="chat-qr-btn" onClick={() => handleQuickReply('Who can receive O- blood?')}>
+            Compatibility
           </button>
-          <button className="chat-qr-btn" onClick={() => handleQuickReply('I urgently need AB+ blood at CMC')}>
+          <button className="chat-qr-btn" onClick={() => handleQuickReply('I urgently need 2 units of O+ blood at City Hospital')}>
             Emergency
           </button>
         </div>
@@ -200,7 +221,7 @@ export const Chatbot: React.FC = () => {
         <div className="chat-input-row">
           <input
             className="chat-in"
-            placeholder="Ask anything..."
+            placeholder="Ask medical or donation questions..."
             value={inputVal}
             onChange={(e) => setInputVal(e.target.value)}
             onKeyPress={handleKeyPress}
@@ -214,3 +235,4 @@ export const Chatbot: React.FC = () => {
     </>
   );
 };
+export default Chatbot;

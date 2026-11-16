@@ -101,6 +101,57 @@ def donor_dashboard(current_user: dict = Depends(get_current_user)):
         "recentMatches": []
     }
 
+# In-memory store fallback for session/chat persistence
+chat_memory_store: Dict[str, List[Dict[str, Any]]] = {}
+
+def record_chat_message(conversation_id: str, sender: str, text: str, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    entry = {
+        "sender": sender,
+        "text": text,
+        "metadata": metadata or {},
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    if conversation_id not in chat_memory_store:
+        chat_memory_store[conversation_id] = []
+    chat_memory_store[conversation_id].append(entry)
+
+    # Safely persist to Firestore if configured and available
+    if db is not None:
+        try:
+            db.collection("chats").document(conversation_id).collection("messages").add({
+                "sender": sender,
+                "text": text,
+                "metadata": metadata or {},
+                "timestamp": firestore.SERVER_TIMESTAMP
+            })
+        except Exception as e:
+            print(f"Warning: Failed to persist chat message to Firestore: {e}")
+    return entry
+
+# --- Health Endpoints ---
+@app.get("/health")
+@app.get("/api/health")
+def health_check():
+    index_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "rag_index")
+    faiss_bin = os.path.join(index_dir, "faiss_index.bin")
+    chunks_pkl = os.path.join(index_dir, "chunks.pkl")
+    faiss_ready = os.path.exists(faiss_bin) and os.path.exists(chunks_pkl)
+
+    return {
+        "status": "healthy",
+        "service": "lifelink-ai-medical-assistant",
+        "version": "1.0.0",
+        "faiss_index": {
+            "loaded": faiss_ready,
+            "directory": index_dir
+        },
+        "nlp_pipeline": {
+            "ready": True
+        },
+        "firestore_connected": db is not None,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
 class NLPRequest(BaseModel):
     text: str
 
@@ -123,61 +174,142 @@ class ChatMessage(BaseModel):
     conversation_id: str
     text: str
 
+EMERGENCY_REFERRAL_NOTICE = (
+    "🚨 IMMEDIATE MEDICAL NOTICE: In a life-threatening medical emergency, please call emergency services immediately "
+    "(Dial 108 / 112 in India, 911 in the US) or proceed directly to the nearest hospital casualty/emergency room. "
+    "Do not delay urgent clinical care."
+)
+
+MEDICAL_SAFETY_DISCLAIMER = (
+    "⚠️ Informational Guidance: LifeLink AI is an automated informational assistant, not a doctor. "
+    "This guidance is based on standard blood donation criteria and does not constitute formal medical clearance or diagnosis. "
+    "Clinical eligibility is determined on-site by certified healthcare professionals."
+)
+
 @app.post("/api/chat/message")
 def chat_message(request: ChatMessage):
+    clean_text = request.text.strip()
+    
     # Process NLP
     nlp_pipeline = get_nlp_pipeline()
-    nlp_result = nlp_pipeline.process(request.text)
+    nlp_result = nlp_pipeline.process(clean_text)
     
     intent = nlp_result.get("intent", "general")
+    confidence = nlp_result.get("confidence", 0.0)
     
-    # Store user message
-    db.collection("chats").document(request.conversation_id).collection("messages").add({
-        "sender": "user",
-        "text": request.text,
-        "timestamp": firestore.SERVER_TIMESTAMP
-    })
+    # Record user message in memory & Firestore
+    record_chat_message(request.conversation_id, "user", clean_text)
     
     response_data = {
         "intent": intent,
-        "confidence": nlp_result.get("confidence", 0.0)
+        "confidence": confidence,
+        "medical_disclaimer": MEDICAL_SAFETY_DISCLAIMER
     }
     
-    if intent == "emergency_request":
+    # Check for emergency signals
+    emergency_keywords = ["emergency", "critical", "urgent", "accident", "trauma", "hemorrhage", "bleeding", "need blood urgently", "icu"]
+    is_emergency_text = any(kw in clean_text.lower() for kw in emergency_keywords)
+    
+    if intent == "emergency_request" or (is_emergency_text and intent == "blood_search"):
         response_data["type"] = "emergency_confirm"
         bg = nlp_result.get('blood_group', 'Unknown')
-        qty = nlp_result.get('quantity', 'Unknown')
-        hosp = nlp_result.get('hospital', 'Unknown')
-        response_data["reply"] = f"I detected an emergency request. Blood: {bg}, Units: {qty}, Hospital: {hosp}. Do you want to create this request?"
-        response_data["urgency"] = nlp_result.get("urgency", "Normal")
+        qty = nlp_result.get('quantity', 1)
+        hosp = nlp_result.get('hospital', 'Nearest Certified Hospital')
+        urgency = nlp_result.get("urgency", "Critical" if "accident" in clean_text.lower() or "critical" in clean_text.lower() else "Urgent")
         
-        # Attach raw parsed data for the frontend to auto-fill
+        response_data["reply"] = (
+            f"{EMERGENCY_REFERRAL_NOTICE}\n\n"
+            f"I detected an urgent emergency blood request:\n"
+            f"• Blood Type: {bg}\n"
+            f"• Units Required: {qty}\n"
+            f"• Facility: {hosp}\n"
+            f"• Urgency: {urgency}\n\n"
+            f"Would you like to broadcast this emergency request to verified compatible donors on the LifeLink network?"
+        )
+        response_data["urgency"] = urgency
+        response_data["emergency_referral"] = {
+            "emergency_numbers": ["108", "112"],
+            "guidance": "Seek immediate emergency hospital attention in life-threatening situations."
+        }
+        
+        # Attach raw parsed data for frontend auto-fill
         response_data["parsed_data"] = {
             "blood_group": bg,
             "quantity": qty,
             "hospital": hosp,
-            "urgency": response_data["urgency"]
+            "urgency": urgency
         }
-    elif intent in ["general", "unknown"]:
+    elif intent in ["general", "unknown"] and not any(kw in clean_text.lower() for kw in ["donate", "blood", "camp", "eligible", "age", "weight", "tattoo", "surgery"]):
         response_data["type"] = "general"
-        response_data["reply"] = "I am LifeLink AI. I can help with blood donation info or emergency requests. Please ask a specific question!"
+        response_data["reply"] = (
+            "I am LifeLink AI, an automated informational assistant (not a doctor). "
+            "I can answer questions regarding blood donation eligibility, ABO/Rh blood compatibility, donation procedures, and donation camps, "
+            "or help you broadcast an urgent emergency blood request.\n\n"
+            f"{MEDICAL_SAFETY_DISCLAIMER}"
+        )
     else:
-        # RAG query
+        # RAG query for medical knowledge retrieval
         index_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "rag_index")
         from rag.pipeline import get_rag_pipeline
         rag_pipeline = get_rag_pipeline(index_dir)
-        rag_res = rag_pipeline.query(request.text)
+        rag_res = rag_pipeline.query(clean_text)
         
         response_data["type"] = "rag"
         response_data["reply"] = rag_res["answer"]
         response_data["source"] = rag_res["document_metadata"]
+        response_data["similarity_scores"] = rag_res.get("similarity_scores", [])
         
-    # Store bot message
-    db.collection("chats").document(request.conversation_id).collection("messages").add({
-        "sender": "bot",
-        "text": response_data["reply"],
-        "metadata": response_data,
-        "timestamp": firestore.SERVER_TIMESTAMP
-    })
+    # Record bot message in memory & Firestore
+    record_chat_message(request.conversation_id, "bot", response_data["reply"], response_data)
     
     return response_data
+
+@app.get("/api/chat/history/{conversation_id}")
+def get_chat_history(conversation_id: str):
+    """Retrieve full chat history for a given conversation ID (memory store with Firestore sync)."""
+    # Prefer in-memory store if populated
+    if conversation_id in chat_memory_store and len(chat_memory_store[conversation_id]) > 0:
+        return {
+            "conversation_id": conversation_id,
+            "messages": chat_memory_store[conversation_id]
+        }
+        
+    # If not in memory but Firestore is active, fetch from Firestore
+    if db is not None:
+        try:
+            docs = (
+                db.collection("chats")
+                .document(conversation_id)
+                .collection("messages")
+                .order_by("timestamp")
+                .stream()
+            )
+            messages = []
+            for doc in docs:
+                m = doc.to_dict()
+                messages.append({
+                    "sender": m.get("sender"),
+                    "text": m.get("text"),
+                    "metadata": m.get("metadata", {}),
+                    "timestamp": m.get("timestamp").isoformat() if hasattr(m.get("timestamp"), "isoformat") else str(m.get("timestamp"))
+                })
+            chat_memory_store[conversation_id] = messages
+            return {
+                "conversation_id": conversation_id,
+                "messages": messages
+            }
+        except Exception as e:
+            print(f"Warning: Failed to read from Firestore: {e}")
+            
+    return {
+        "conversation_id": conversation_id,
+        "messages": []
+    }
+
+@app.delete("/api/chat/history/{conversation_id}")
+def clear_chat_history(conversation_id: str):
+    """Clear conversation history."""
+    if conversation_id in chat_memory_store:
+        del chat_memory_store[conversation_id]
+    return {"success": True, "conversation_id": conversation_id}
+

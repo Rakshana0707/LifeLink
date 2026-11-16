@@ -15,14 +15,14 @@ class NamedEntityExtractor:
         }
         
         # 1. Regex for Blood Group
-        bg_match = re.search(r'(?i)\b(A|B|AB|O)[\s\-]*(positive|negative|pos|neg|\+|\-)\b', text)
+        bg_match = re.search(r'(?i)\b(A|B|AB|O)[\s\-]*(positive|negative|pos|neg|\+|\-)(?!\w)', text)
         if bg_match:
-            entities["blood_group"] = bg_match.group(0)
+            entities["blood_group"] = bg_match.group(0).strip()
             
         # 2. Regex for Quantity
-        qty_match = re.search(r'(?i)\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+(units?|bags?|packs?)\b', text)
+        qty_match = re.search(r'(?i)\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s*(units?|bags?|packs?|pints?)\b', text)
         if qty_match:
-            entities["quantity"] = qty_match.group(1)
+            entities["quantity"] = qty_match.group(1).strip()
             
         # 3. Transformer NER for Locations and Organizations
         ner_results = self.ner_pipeline(text)

@@ -1,3 +1,4 @@
+import re
 from .intent_classifier import IntentClassifier
 from .ner import NamedEntityExtractor
 from .urgency_classifier import UrgencyClassifier
@@ -14,11 +15,22 @@ class NLPPipeline:
         # 1. Intent Classification
         intent_result = self.intent_clf.predict(text)
         
-        # If it's an emergency, extract more details
-        entities = {}
+        # Check emergency patterns
+        has_blood = bool(re.search(r'(?i)\b(A|B|AB|O)[\s\-]*(positive|negative|pos|neg|\+|\-)(?!\w)', text))
+        has_emergency_keyword = any(kw in text.lower() for kw in [
+            "urgent", "urgently", "emergency", "immediately", "critical", "need blood", 
+            "bleeding", "accident", "require blood", "icu"
+        ])
+
+        entities = {
+            "blood_group": "",
+            "quantity": 1,
+            "hospital": None,
+            "location": None
+        }
         urgency = "Normal"
         
-        if intent_result["intent"] in ["emergency_request", "blood_search"]:
+        if intent_result["intent"] in ["emergency_request", "blood_search"] or has_blood or has_emergency_keyword:
             # 2. NER
             raw_entities = self.ner_extractor.extract(text)
             
@@ -32,6 +44,8 @@ class NLPPipeline:
                 "hospital": raw_entities.get("hospital"),
                 "location": raw_entities.get("location")
             }
+            if has_emergency_keyword and intent_result["intent"] in ["general", "eligibility_inquiry", "camp_inquiry"]:
+                intent_result["intent"] = "emergency_request"
             
         return {
             "intent": intent_result["intent"],
