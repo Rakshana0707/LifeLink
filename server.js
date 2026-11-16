@@ -242,7 +242,7 @@ setInterval(() => {
   notificationService.processDeliveryQueue(db, { sendTelegramMessage, limit: 50 }).catch((err) => {
     console.error('[notifications] delivery sweep error:', err.message);
   });
-}, 20000);
+}, 20000).unref();
 
 /* ==========================================
    LOOKUP HELPERS (blood groups, locations)
@@ -1255,7 +1255,7 @@ setInterval(() => {
       } catch { /* ignore individual failures, next sweep will retry */ }
     });
   } catch { /* swallow sweep errors so the interval keeps running */ }
-}, 30000);
+}, 30000).unref();
 
 // Background sweep: appointment + donation camp reminders. Each row is reminded exactly
 // once (reminded_at is set immediately after a successful notify() call) so re-running the
@@ -1316,7 +1316,7 @@ setInterval(() => {
   } catch (err) {
     console.error('[notifications] reminder sweep error:', err.message);
   }
-}, 60000);
+}, 60000).unref();
 
 // Background sweep: network-wide blood shortage alerts. Checks total units per blood group
 // across every blood bank; if the citywide total falls at/below the shortage threshold,
@@ -1349,7 +1349,7 @@ setInterval(() => {
   } catch (err) {
     console.error('[notifications] shortage sweep error:', err.message);
   }
-}, 5 * 60000);
+}, 5 * 60000).unref();
 
 /* ==========================================
    CAMPS + CAMP REGISTRATIONS API
@@ -2861,13 +2861,16 @@ app.get('/api/forecast/history', requireAdmin, (req, res) => {
    TELEGRAM POLLING + SPA FALLBACK
    ========================================== */
 
-startTelegramPolling();
-
 app.get('*', (req, res, next) => {
   if (req.path.startsWith('/api')) return next();
   res.sendFile(path.join(__dirname, 'client/dist/index.html'));
 });
 
-app.listen(PORT, () => {
-  console.log(`Server is running at http://localhost:${PORT}`);
-});
+if (require.main === module) {
+  startTelegramPolling();
+  app.listen(PORT, () => {
+    console.log(`Server is running at http://localhost:${PORT}`);
+  });
+}
+
+module.exports = app;
