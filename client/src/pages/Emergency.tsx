@@ -433,6 +433,9 @@ export const EmergencyBoard: React.FC = () => {
                 onChange={(e) => setNotes(e.target.value)}
               />
             </div>
+            <div style={{ padding: '10px 12px', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: '8px', fontSize: '11px', color: '#991b1b', marginBottom: '14px', lineHeight: 1.4 }}>
+              <strong>⚠️ Clinical Notice:</strong> LifeLink algorithmic matching aids emergency notification triage and does not substitute for clinical cross-matching (major/minor compatibility testing) or mandatory on-site donor screening prior to transfusion.
+            </div>
             <button type="submit" className="btn btn-emergency btn-full" style={{ justifyContent: 'center' }}>
               🚨 Broadcast Emergency Request
             </button>

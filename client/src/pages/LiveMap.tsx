@@ -4,6 +4,7 @@ import { useToast } from '../context/ToastContext';
 import { api, type Emergency, type Hospital, type BloodBank, type Camp, type DonorSearchResult, type BloodAvailabilityResult } from '../api';
 import { LeafletMap, type SelectedMarker } from '../components/LeafletMap';
 import { useGeolocation, getDistanceKm, formatDistance } from '../utils/geo';
+import { useEventStream } from '../utils/sse';
 
 const BLOOD_TYPES = ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-'];
 const RADIUS_OPTIONS = [
@@ -72,6 +73,19 @@ export const LiveMap: React.FC = () => {
     api.getBloodBanks().then(setBloodBanks).catch(console.error);
     api.getCamps().then(setCamps).catch(console.error);
   }, []);
+
+  // Real-time synchronization: map pins dynamically reflect newly created emergencies
+  // and status updates (fulfilled, cancelled, expired) via Server-Sent Events.
+  useEventStream('emergency:created', (data) => {
+    if (data?.emergency) {
+      setEmergencies((prev) => (prev.some((e) => e.id === data.emergency.id) ? prev : [data.emergency, ...prev]));
+    }
+  });
+  useEventStream('emergency:status', (data) => {
+    if (data?.emergency) {
+      setEmergencies((prev) => prev.map((e) => (e.id === data.emergency.id ? data.emergency : e)));
+    }
+  });
 
   // Privacy-safe donor fetch: only ever uses the dedicated donor-search endpoint
   // (approximate coordinates + masked names), never raw /api/users coordinates.

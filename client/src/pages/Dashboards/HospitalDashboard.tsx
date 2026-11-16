@@ -212,6 +212,9 @@ export const HospitalDashboard: React.FC = () => {
                   <div className="card-title" style={{ color: awaitingReserve.length > 0 ? 'var(--red)' : undefined }}>
                     🙋 Donors Ready to Reserve ({awaitingReserve.length})
                   </div>
+                  <div style={{ fontSize: '11px', color: 'var(--txt3)', marginBottom: '8px', lineHeight: 1.3 }}>
+                    ℹ️ Algorithmic matches require standard clinical cross-match & vitals screening prior to collection.
+                  </div>
                   {loading ? <CardSkeleton /> : awaitingReserve.length === 0 ? (
                     <EmptyState icon="⏳" title="No pending responses" body="Donors who accept your requests appear here." />
                   ) : (

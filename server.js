@@ -24,6 +24,8 @@ if (process.env.TRUST_PROXY === 'true') app.set('trust proxy', 1);
 
 const db = new DatabaseSync(path.join(__dirname, 'lifelink.db'));
 db.exec('PRAGMA foreign_keys = ON;');
+db.exec('PRAGMA journal_mode = WAL;');
+db.exec('PRAGMA busy_timeout = 5000;');
 console.log('Connected to the SQLite database (node:sqlite).');
 try {
   const userCols = db.prepare('PRAGMA table_info(users)').all();
@@ -896,24 +898,21 @@ const transitionEmergency = (id, toStatus, { actorId = null, actorLabel = 'syste
   return updated;
 };
 
-// Real compatibility-aware donor matching (reuses the same blood_compatibility table
-// as AI Match / Find Blood) — not just an exact blood-type filter.
-const findCompatibleDonors = (recipientBloodType, limit = 8) => {
-  const compatibleDonorGroupIds = db
-    .prepare('SELECT donor_group_id FROM blood_compatibility WHERE recipient_group_id = ?')
-    .all(groupIdByType[recipientBloodType])
-    .map((r) => r.donor_group_id);
-  if (compatibleDonorGroupIds.length === 0) return [];
-  const placeholders = compatibleDonorGroupIds.map(() => '?').join(',');
-  return db
-    .prepare(
-      `SELECT u.id, u.name, u.telegram_chat_id, u.total_donations, dp.blood_group_id
-       FROM users u JOIN donor_profiles dp ON dp.user_id = u.id
-       WHERE u.role = 'Donor' AND u.status = 'Active' AND dp.blood_group_id IN (${placeholders})
-       ORDER BY u.total_donations DESC`
-    )
-    .all(...compatibleDonorGroupIds)
-    .slice(0, limit);
+// Real compatibility-aware donor matching (delegates to the authoritative matching engine
+// in matching.js) — enforces ABO/Rh compatibility, 90-day medical eligibility interval,
+// donor availability status, and geo-distance filtering.
+const findCompatibleDonors = (recipientBloodType, limit = 8, opts = {}) => {
+  const result = rankDonorsForRequest(db, {
+    requestedBloodType: recipientBloodType,
+    urgency: opts.urgency || 'Normal',
+    lat: opts.lat ?? null,
+    lng: opts.lng ?? null,
+    radiusKm: opts.radiusKm ?? 15,
+    limit,
+    weights: opts.weights || {},
+    groupIdByType
+  });
+  return result.results;
 };
 
 app.get('/api/emergencies', (req, res) => {
@@ -976,20 +975,35 @@ app.post('/api/emergencies', rateLimit('emergency-create', 20, 60000), async (re
 
     // 2. System identifies compatible donors/blood sources -> Searching
     transitionEmergency(id, 'Searching', { actorLabel: 'system', note: 'Identifying compatible donors and blood sources' });
-    const candidates = findCompatibleDonors(bloodType, 8);
+    const emergencyLat = lat != null ? Number(lat) : (hospRow?.lat || hospRow?.loc_lat || null);
+    const emergencyLng = lng != null ? Number(lng) : (hospRow?.lng || hospRow?.loc_lng || null);
+    const radiusKmVal = Number(req.body.radiusKm) || 15;
+    const candidates = findCompatibleDonors(bloodType, 8, {
+      urgency,
+      lat: emergencyLat,
+      lng: emergencyLng,
+      radiusKm: radiusKmVal
+    });
 
     const insertMatch = db.prepare(
       `INSERT INTO donor_matches (emergency_id, donor_id, compatibility_score, distance_km, reliability_score, response_score, status)
        VALUES (?, ?, ?, ?, ?, ?, 'Suggested')`
     );
     candidates.forEach((d) => {
-      const compatScore = d.blood_group_id === groupIdVal ? 100 : 80;
-      const reliability = Math.min(99, 60 + d.total_donations * 2);
-      insertMatch.run(id, d.id, compatScore, null, reliability, 75);
+      const compatScore = Math.round((d.factors?.compatibility?.score ?? 1) * 100);
+      const reliability = Math.round((d.factors?.history?.score ?? 0.7) * 100);
+      const responseScore = Math.round((d.factors?.responseRate?.score ?? 0.75) * 100);
+      const distanceKm = d.distanceKm != null ? Math.round(d.distanceKm * 10) / 10 : null;
+      insertMatch.run(id, d.id, compatScore, distanceKm, reliability, responseScore);
     });
     db.prepare(
-      `INSERT INTO ai_predictions (prediction_type, subject_type, subject_id, score, features, model_version) VALUES ('donor_match', 'emergency', ?, 0.9, ?, 'rule-based-v1')`
-    ).run(id, JSON.stringify({ note: 'Rule-based heuristic score, not a trained model.', candidateCount: candidates.length }));
+      `INSERT INTO ai_predictions (prediction_type, subject_type, subject_id, score, features, model_version) VALUES ('donor_match', 'emergency', ?, ?, ?, ?)`
+    ).run(
+      id,
+      candidates[0]?.matchScore != null ? candidates[0].matchScore / 100 : null,
+      JSON.stringify({ note: 'Algorithmic ranking by LifeLink matching engine.', candidateCount: candidates.length, topScore: candidates[0]?.matchScore }),
+      MATCHING_STRATEGY
+    );
 
     // 3. Matching process starts -> Donors Notified (only if we actually found candidates)
     if (candidates.length > 0) {
@@ -1148,6 +1162,9 @@ app.post('/api/emergencies/:id/fulfill', requireHospital, (req, res) => {
            VALUES (?, ?, ?, ?, ?, ?, 'Completed', date('now'), 'Emergency-response donation, collected on-site.')`
         ).run(donationId, reservedMatch.donor_id, emergency.blood_group_id, emergency.hospital_id, id, emergency.units_needed);
         db.prepare("UPDATE users SET total_donations = total_donations + 1, xp = xp + 220, updated_at = datetime('now') WHERE id = ?").run(reservedMatch.donor_id);
+        db.prepare(
+          "UPDATE donor_profiles SET last_donation_date = date('now'), next_eligible_date = date('now', '+90 days'), updated_at = datetime('now') WHERE user_id = ?"
+        ).run(reservedMatch.donor_id);
         db.prepare("UPDATE donor_matches SET status = 'Donated', updated_at = datetime('now') WHERE id = ?").run(reservedMatch.id);
         if (emergency.hospital_id) {
           db.prepare("UPDATE hospital_profiles SET quota_used = quota_used + ?, updated_at = datetime('now') WHERE user_id = ?").run(emergency.units_needed, emergency.hospital_id);

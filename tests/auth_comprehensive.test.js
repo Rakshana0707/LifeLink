@@ -10,6 +10,7 @@ const { createSessionToken, verifySessionToken } = require('../auth');
 
 const dbPath = path.join(__dirname, '..', 'lifelink.db');
 const db = new DatabaseSync(dbPath);
+db.exec('PRAGMA busy_timeout = 5000;');
 
 let server;
 let baseUrl;

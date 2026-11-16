@@ -179,12 +179,17 @@ const rankDonorsForRequest = (db, params) => {
 
   const candidates = db
     .prepare(
-      `SELECT u.id, u.name, u.lat, u.lng, u.total_donations,
-              dp.blood_group_id, dp.availability_status, dp.last_donation_date, loc.label as location_label
+      `SELECT u.id, u.name,
+              COALESCE(u.lat, loc.lat) as lat,
+              COALESCE(u.lng, loc.lng) as lng,
+              u.total_donations,
+              dp.blood_group_id, dp.availability_status,
+              COALESCE(dp.last_donation_date, (SELECT MAX(donation_date) FROM donations WHERE donor_id = u.id AND status = 'Completed')) as last_donation_date,
+              loc.label as location_label
        FROM users u
        JOIN donor_profiles dp ON dp.user_id = u.id
        LEFT JOIN locations loc ON loc.id = u.location_id
-       WHERE u.role = 'Donor' AND u.is_new_registration = 0 AND dp.blood_group_id IN (${placeholders})`
+       WHERE u.role = 'Donor' AND u.status = 'Active' AND u.is_new_registration = 0 AND dp.blood_group_id IN (${placeholders})`
     )
     .all(...compatibleGroupIds.map((r) => r.donor_group_id));
 
@@ -216,8 +221,11 @@ const rankDonorsForRequest = (db, params) => {
     const { matchScore, eligible, factors } = scoreDonor(donorInput, { effectiveRadiusKm }, weights);
 
     return {
+      id: c.id,
       donorId: c.id,
+      name: c.name,
       displayName: maskName(c.name),
+      blood_group_id: c.blood_group_id,
       matchScore,
       eligible,
       distanceKm,
@@ -225,11 +233,19 @@ const rankDonorsForRequest = (db, params) => {
       availabilityStatus: c.availability_status,
       lastDonationDate: c.last_donation_date,
       donationCount: c.total_donations,
+      total_donations: c.total_donations,
       factors
     };
   });
 
-  const inRadius = scored.filter((s) => s.eligible && (s.distanceKm === null || s.distanceKm <= effectiveRadiusKm));
+  const hasOrigin = lat != null && lng != null;
+  const inRadius = scored.filter((s) => {
+    if (!s.eligible) return false;
+    if (hasOrigin) {
+      return s.distanceKm !== null && s.distanceKm <= effectiveRadiusKm;
+    }
+    return true;
+  });
   inRadius.sort((a, b) => b.matchScore - a.matchScore);
 
   return {
