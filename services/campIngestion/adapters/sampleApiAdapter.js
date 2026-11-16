@@ -17,19 +17,43 @@
 
 const fs = require('fs');
 const path = require('path');
+const { safeFetchWithRetry } = require('../httpClient');
 
 const SOURCE_NAME = 'Sample Regional Health API (demo fixture)';
 const FIXTURE_PATH = path.join(__dirname, '..', 'fixtures', 'sample-official-api-response.json');
 
 const fetchOfficialApiCamps = async () => {
-  // --- Replace this block with a real fetch() call once a live endpoint is configured ---
-  // Example of what that would look like:
-  //   const res = await fetch(process.env.HEALTH_API_URL, { headers: { Authorization: `Bearer ${process.env.HEALTH_API_KEY}` } });
-  //   const data = await res.json();
-  const data = JSON.parse(fs.readFileSync(FIXTURE_PATH, 'utf-8'));
-  // --- end replaceable block ---
+  // If a live health API endpoint is configured, fetch with timeout and retries
+  if (process.env.HEALTH_API_URL) {
+    const headers = {};
+    if (process.env.HEALTH_API_KEY) {
+      headers.Authorization = `Bearer ${process.env.HEALTH_API_KEY}`;
+    }
+    const result = await safeFetchWithRetry(process.env.HEALTH_API_URL, {
+      headers,
+      timeoutMs: 8000,
+      maxRetries: 2
+    });
 
-  return { records: data.camps || [], sourceUrl: data.meta?.sourceUrl || null };
+    if (!result.ok) {
+      return {
+        records: [],
+        sourceUrl: process.env.HEALTH_API_URL,
+        unavailable: true,
+        error: `External official API unavailable: ${result.error}`
+      };
+    }
+    const data = result.data || {};
+    return { records: data.camps || [], sourceUrl: data.meta?.sourceUrl || process.env.HEALTH_API_URL };
+  }
+
+  // Demo fixture fallback when no live external URL is provided
+  try {
+    const data = JSON.parse(fs.readFileSync(FIXTURE_PATH, 'utf-8'));
+    return { records: data.camps || [], sourceUrl: data.meta?.sourceUrl || null };
+  } catch (err) {
+    return { records: [], sourceUrl: null, error: `Failed to read local fixture: ${err.message}` };
+  }
 };
 
 module.exports = { fetchOfficialApiCamps, SOURCE_NAME };

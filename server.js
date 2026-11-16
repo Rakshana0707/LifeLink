@@ -8,6 +8,7 @@ const { DatabaseSync } = require('node:sqlite');
 const { sendTelegramMessage, generateOtpCode, startTelegramPolling } = require('./telegram');
 const { sendEmail } = require('./mailer');
 const { rankDonorsForRequest, DEFAULT_WEIGHTS, MATCHING_STRATEGY } = require('./matching');
+const { computeDedupeKey, findDuplicate } = require('./services/campIngestion/dedupe');
 const notificationService = require('./services/notifications');
 const { getActorFromRequest, admin } = require('./firebase_auth');
 const { createSessionToken } = require('./auth');
@@ -1403,12 +1404,44 @@ const buildCampResponse = (c) => ({
 
 app.get('/api/camps', (req, res) => {
   try {
-    const rows = db.prepare(`
+    const { city, status, approved, source, verification_status, upcoming, q } = req.query;
+    let sql = `
       SELECT c.*, loc.lat as loc_lat, loc.lng as loc_lng
       FROM camps c
       LEFT JOIN locations loc ON loc.id = c.location_id
-      ORDER BY c.camp_date
-    `).all();
+      WHERE 1=1
+    `;
+    const params = [];
+    if (city && city !== 'All Cities') {
+      sql += ' AND c.city = ?';
+      params.push(city);
+    }
+    if (status) {
+      sql += ' AND c.status = ?';
+      params.push(status);
+    }
+    if (approved !== undefined) {
+      sql += ' AND c.approved = ?';
+      params.push(approved === 'true' || approved === '1' ? 1 : 0);
+    }
+    if (source) {
+      sql += ' AND c.source = ?';
+      params.push(source);
+    }
+    if (verification_status) {
+      sql += ' AND c.verification_status = ?';
+      params.push(verification_status);
+    }
+    if (upcoming === 'true' || upcoming === '1') {
+      sql += " AND date(c.camp_date) >= date('now')";
+    }
+    if (q) {
+      sql += ' AND (c.title LIKE ? OR c.venue LIKE ? OR c.organizer_name LIKE ? OR c.city LIKE ?)';
+      const term = `%${q}%`;
+      params.push(term, term, term, term);
+    }
+    sql += ' ORDER BY c.camp_date ASC';
+    const rows = db.prepare(sql).all(...params);
     res.json(rows.map(buildCampResponse));
   } catch (err) {
     sendError(res, err);
@@ -1429,53 +1462,195 @@ app.get('/api/camps/:id', (req, res) => {
   }
 });
 
-// Directly hand-submitted camps (existing "Organize a Camp" flow). This stays a distinct,
-// simple endpoint from the multi-source ingestion pipeline below — an authenticated
-// submission through LifeLink's own form is inherently a first-party manual entry.
-// Community camp submissions are open to any visitor (organizers don't need an account) —
-// new submissions land as Unverified/Under Review until an Admin approves them via
-// PUT /api/camps/:id, so this intentionally stays unauthenticated, just rate-limited.
-app.post('/api/camps', rateLimit('camp-create', 20, 3600000), (req, res) => {
+// Directly hand-submitted camps (both admin creation and community "Organize a Camp" flow).
+// Community submissions land as Unverified/Pending Approval. Admin submissions land as Verified/Scheduled.
+app.post('/api/camps', rateLimit('camp-create', 20, 3600000), async (req, res) => {
   try {
-    const { id, title, date, location, registered, limit, approved, status, organizer, venue, city, state, contactPhone, contactEmail, registrationUrl } = req.body;
-    const locationId = location ? findOrCreateLocation(location, null, null) : null;
+    const { id, title, date, location, registered, limit, approved, status, organizer, venue, city, state, contactPhone, contactEmail, registrationUrl, lat, lng } = req.body;
+    if (!title || !date || (!venue && !location)) {
+      return res.status(400).json({ error: 'Title, date, and venue/location are required.' });
+    }
+
+    const campCity = city ? city.trim() : 'Coimbatore';
+    const dedupeKey = computeDedupeKey(title, date, campCity);
+    const existing = findDuplicate(db, dedupeKey);
+    if (existing) {
+      return res.status(409).json({ error: `A camp matching this title, date, and city already exists (${existing.id}).` });
+    }
+
+    const actor = await getActorFromRequest(req, db);
+    const isAdmin = actor && actor.role === 'Admin';
+    const effectiveApproved = isAdmin ? (approved !== undefined ? (approved ? 1 : 0) : 1) : 0;
+    const effectiveStatus = isAdmin ? (status || 'Scheduled') : 'Pending Approval';
+    const effectiveVerification = isAdmin ? 'Verified' : 'Unverified';
+    const effectiveSource = 'manual';
+    const effectiveSourceName = isAdmin ? 'LifeLink Admin Entry' : 'Community Submission';
+
+    const campId = id || 'camp-manual-' + Date.now();
+    const effectiveLocation = location || venue;
+    const locationId = effectiveLocation ? findOrCreateLocation(effectiveLocation, lat ?? null, lng ?? null) : null;
+    const capacityVal = limit ? parseInt(limit, 10) : 50;
+
     db.prepare(
       `INSERT INTO camps (
-         id, title, organizer_name, location_id, location_label, venue, city, state, camp_date,
+         id, title, organizer_name, location_id, location_label, venue, city, state, lat, lng, camp_date,
          contact_phone, contact_email, registration_url, capacity, registered_count, approved, status,
          source, source_name, verification_status, dedupe_key
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', 'LifeLink Direct Entry', 'Unverified', ?)`
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
-      id, title, organizer || null, locationId, location, venue || location, city || 'Coimbatore', state || 'Tamil Nadu', date,
-      contactPhone || null, contactEmail || null, registrationUrl || null, limit, registered || 0, approved ? 1 : 0, status || 'Under Review',
-      `manual-${id}`
+      campId, title.trim(), organizer ? organizer.trim() : null, locationId, effectiveLocation, venue || effectiveLocation,
+      campCity, state ? state.trim() : 'Tamil Nadu', lat ?? null, lng ?? null, date,
+      contactPhone ? contactPhone.trim() : null, contactEmail ? contactEmail.trim() : null, registrationUrl ? registrationUrl.trim() : null,
+      capacityVal, registered ? parseInt(registered, 10) : 0, effectiveApproved, effectiveStatus,
+      effectiveSource, effectiveSourceName, effectiveVerification, dedupeKey
     );
+
+    const created = db.prepare(`
+      SELECT c.*, loc.lat as loc_lat, loc.lng as loc_lng
+      FROM camps c LEFT JOIN locations loc ON loc.id = c.location_id
+      WHERE c.id = ?
+    `).get(campId);
+
+    res.json({ success: true, camp: buildCampResponse(created) });
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+// Full camp editing for admins
+app.put('/api/camps/:id', requireAdmin, (req, res) => {
+  try {
+    const { id } = req.params;
+    const existing = db.prepare('SELECT * FROM camps WHERE id = ?').get(id);
+    if (!existing) return res.status(404).json({ error: 'Camp not found' });
+
+    const {
+      title, date, camp_date, venue, location, city, state, organizer, organizer_name,
+      contactPhone, contact_phone, contactEmail, contact_email, registrationUrl, registration_url,
+      capacity, limit, registered, registered_count, approved, status, lat, lng
+    } = req.body;
+
+    const fields = [];
+    const params = [];
+
+    const newTitle = title !== undefined ? title.trim() : existing.title;
+    const newDate = (date || camp_date) !== undefined ? (date || camp_date) : existing.camp_date;
+    const newCity = city !== undefined ? city.trim() : existing.city;
+
+    if (title !== undefined) { fields.push('title = ?'); params.push(newTitle); }
+    if (date !== undefined || camp_date !== undefined) { fields.push('camp_date = ?'); params.push(newDate); }
+    if (venue !== undefined) { fields.push('venue = ?'); params.push(venue ? venue.trim() : null); }
+    if (location !== undefined) { fields.push('location_label = ?'); params.push(location ? location.trim() : null); }
+    if (city !== undefined) { fields.push('city = ?'); params.push(newCity); }
+    if (state !== undefined) { fields.push('state = ?'); params.push(state ? state.trim() : null); }
+    if (organizer !== undefined || organizer_name !== undefined) {
+      fields.push('organizer_name = ?');
+      params.push((organizer || organizer_name) ? (organizer || organizer_name).trim() : null);
+    }
+    if (contactPhone !== undefined || contact_phone !== undefined) {
+      fields.push('contact_phone = ?');
+      params.push((contactPhone || contact_phone) ? (contactPhone || contact_phone).trim() : null);
+    }
+    if (contactEmail !== undefined || contact_email !== undefined) {
+      fields.push('contact_email = ?');
+      params.push((contactEmail || contact_email) ? (contactEmail || contact_email).trim() : null);
+    }
+    if (registrationUrl !== undefined || registration_url !== undefined) {
+      fields.push('registration_url = ?');
+      params.push((registrationUrl || registration_url) ? (registrationUrl || registration_url).trim() : null);
+    }
+    if (limit !== undefined || capacity !== undefined) {
+      fields.push('capacity = ?');
+      params.push(parseInt(limit || capacity, 10));
+    }
+    if (registered !== undefined || registered_count !== undefined) {
+      fields.push('registered_count = ?');
+      params.push(parseInt(registered || registered_count, 10));
+    }
+    if (lat !== undefined) { fields.push('lat = ?'); params.push(lat); }
+    if (lng !== undefined) { fields.push('lng = ?'); params.push(lng); }
+
+    if (approved !== undefined) {
+      fields.push('approved = ?');
+      params.push(approved ? 1 : 0);
+      if (approved && existing.source === 'manual') {
+        fields.push("verification_status = 'Verified'");
+      }
+    }
+    if (status !== undefined) { fields.push('status = ?'); params.push(status); }
+
+    // Recompute dedupe_key if title, date, or city was changed
+    if (newTitle !== existing.title || newDate !== existing.camp_date || newCity !== existing.city) {
+      fields.push('dedupe_key = ?');
+      params.push(computeDedupeKey(newTitle, newDate, newCity));
+    }
+
+    if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
+    fields.push("updated_at = datetime('now')");
+    params.push(id);
+    db.prepare(`UPDATE camps SET ${fields.join(', ')} WHERE id = ?`).run(...params);
+
+    const updated = db.prepare(`
+      SELECT c.*, loc.lat as loc_lat, loc.lng as loc_lng
+      FROM camps c LEFT JOIN locations loc ON loc.id = c.location_id
+      WHERE c.id = ?
+    `).get(id);
+
+    res.json({ success: true, camp: buildCampResponse(updated) });
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+// Camp deletion
+app.delete('/api/camps/:id', requireAdmin, (req, res) => {
+  try {
+    const { id } = req.params;
+    const existing = db.prepare('SELECT id FROM camps WHERE id = ?').get(id);
+    if (!existing) return res.status(404).json({ error: 'Camp not found' });
+
+    db.exec('BEGIN');
+    try {
+      db.prepare('DELETE FROM camp_registrations WHERE camp_id = ?').run(id);
+      db.prepare('DELETE FROM appointments WHERE camp_id = ?').run(id);
+      db.prepare('DELETE FROM camps WHERE id = ?').run(id);
+      db.exec('COMMIT');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
+
+    auditLog({ actorId: req.actor.id, actorRole: req.actor.role, action: 'camp_deleted', targetType: 'camp', targetId: id });
     res.json({ success: true });
   } catch (err) {
     sendError(res, err);
   }
 });
 
-app.put('/api/camps/:id', requireAdmin, (req, res) => {
+// Camp cancellation with registrant notification
+app.post('/api/camps/:id/cancel', requireRole('Admin', 'Hospital'), (req, res) => {
   try {
     const { id } = req.params;
-    const { approved, registered, status } = req.body;
-    const fields = [];
-    const params = [];
-    if (approved !== undefined) { fields.push('approved = ?'); params.push(approved ? 1 : 0); }
-    if (registered !== undefined) { fields.push('registered_count = ?'); params.push(registered); }
-    if (status !== undefined) { fields.push('status = ?'); params.push(status); }
-    // Approving a manually-submitted camp through LifeLink's own review flow is treated as
-    // verification — approving an *ingested* camp is not (that always requires the explicit
-    // /verify endpoint below), since first-party review and external-source review are different things.
-    if (approved) {
-      const existing = db.prepare('SELECT source FROM camps WHERE id = ?').get(id);
-      if (existing && existing.source === 'manual') fields.push("verification_status = 'Verified'");
+    const { reason } = req.body;
+    const camp = db.prepare('SELECT * FROM camps WHERE id = ?').get(id);
+    if (!camp) return res.status(404).json({ error: 'Camp not found' });
+
+    db.prepare("UPDATE camps SET status = 'Cancelled', updated_at = datetime('now') WHERE id = ?").run(id);
+
+    const registrants = db.prepare("SELECT donor_id FROM camp_registrations WHERE camp_id = ? AND status = 'Registered'").all(id);
+    if (registrants.length > 0) {
+      notifyMany(registrants.map((r) => r.donor_id), {
+        type: 'camp_update',
+        title: `Donation Camp Cancelled: ${camp.title}`,
+        message: `The blood donation camp "${camp.title}" scheduled for ${camp.camp_date} has been cancelled.${reason ? ` Reason: ${reason}` : ''}`,
+        urgency: 'Normal',
+        relatedType: 'camp',
+        relatedId: id
+      });
+      db.prepare("UPDATE camp_registrations SET status = 'Cancelled' WHERE camp_id = ?").run(id);
     }
-    if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
-    fields.push("updated_at = datetime('now')");
-    params.push(id);
-    db.prepare(`UPDATE camps SET ${fields.join(', ')} WHERE id = ?`).run(...params);
+
+    auditLog({ actorId: req.actor.id, actorRole: req.actor.role, action: 'camp_cancelled', targetType: 'camp', targetId: id, detail: { reason } });
     res.json({ success: true });
   } catch (err) {
     sendError(res, err);
@@ -1568,25 +1743,73 @@ app.post('/api/camp_registrations', requireAuth, (req, res) => {
     if (req.actor.role !== 'Admin' && req.actor.id !== donorId) {
       return res.status(403).json({ error: 'You can only register yourself for a camp.' });
     }
-    const verificationId = 'CR-' + Date.now();
-    db.prepare(
-      `INSERT INTO camp_registrations (camp_id, donor_id, verification_id, slot, status) VALUES (?, ?, ?, ?, 'Registered')`
-    ).run(campId, donorId, verificationId, slot || null);
-    db.prepare('UPDATE camps SET registered_count = registered_count + 1 WHERE id = ?').run(campId);
 
-    const camp = db.prepare('SELECT title, camp_date FROM camps WHERE id = ?').get(campId);
-    if (camp) {
-      notify({
-        userId: donorId,
-        type: 'camp_update',
-        title: 'Camp registration confirmed',
-        message: `Your slot at "${camp.title}" on ${camp.camp_date} is confirmed. Verification ID: ${verificationId}.`,
-        relatedType: 'camp',
-        relatedId: campId
+    const camp = db.prepare('SELECT * FROM camps WHERE id = ?').get(campId);
+    if (!camp) return res.status(404).json({ error: 'Camp not found' });
+
+    if (camp.status === 'Cancelled') {
+      return res.status(400).json({ error: 'This donation camp has been cancelled.' });
+    }
+    if (camp.status !== 'Scheduled' && !camp.approved) {
+      return res.status(400).json({ error: 'This camp is not open for public registrations.' });
+    }
+
+    // 1. Capacity limit check
+    if (camp.capacity && camp.registered_count >= camp.capacity) {
+      return res.status(400).json({ error: `Camp has reached its registration capacity of ${camp.capacity} donors.` });
+    }
+
+    // 2. Duplicate registration prevention
+    const existingReg = db.prepare(
+      "SELECT id, verification_id FROM camp_registrations WHERE camp_id = ? AND donor_id = ? AND status = 'Registered'"
+    ).get(campId, donorId);
+    if (existingReg) {
+      return res.status(409).json({
+        error: 'You are already registered for this camp.',
+        verificationId: existingReg.verification_id
       });
     }
 
-    res.json({ success: true, verificationId });
+    // 3. Slot capacity management (if slot specified)
+    if (slot) {
+      const slotLimit = Math.max(1, Math.ceil((camp.capacity || 50) / 4));
+      const slotCount = db.prepare(
+        "SELECT COUNT(*) as c FROM camp_registrations WHERE camp_id = ? AND slot = ? AND status = 'Registered'"
+      ).get(campId, slot).c;
+      if (slotCount >= slotLimit) {
+        return res.status(400).json({ error: `The slot "${slot}" is fully booked (limit ${slotLimit} donors). Please select another time slot.` });
+      }
+    }
+
+    const verificationId = 'CR-' + Date.now();
+    db.exec('BEGIN');
+    try {
+      db.prepare(
+        `INSERT INTO camp_registrations (camp_id, donor_id, verification_id, slot, status) VALUES (?, ?, ?, ?, 'Registered')`
+      ).run(campId, donorId, verificationId, slot || null);
+      db.prepare('UPDATE camps SET registered_count = registered_count + 1 WHERE id = ?').run(campId);
+      db.exec('COMMIT');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
+
+    notify({
+      userId: donorId,
+      type: 'camp_update',
+      title: 'Camp registration confirmed ⛺',
+      message: `Your slot at "${camp.title}" on ${camp.camp_date} (${slot || 'General'}) is confirmed. Verification ID: ${verificationId}.`,
+      relatedType: 'camp',
+      relatedId: campId
+    });
+
+    res.json({
+      success: true,
+      verificationId,
+      campTitle: camp.title,
+      date: camp.camp_date,
+      slot: slot || 'General'
+    });
   } catch (err) {
     sendError(res, err);
   }

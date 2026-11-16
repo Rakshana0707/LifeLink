@@ -653,21 +653,46 @@ export const api = {
     }).then(handleResponse),
 
   // Camps APIs
-  getCamps: (): Promise<Camp[]> =>
-    authedFetch('/api/camps').then(handleResponse),
+  getCamps: (params?: { city?: string; status?: string; approved?: boolean; source?: string; verification_status?: string; upcoming?: boolean; q?: string }): Promise<Camp[]> => {
+    const q = new URLSearchParams();
+    if (params) {
+      if (params.city) q.set('city', params.city);
+      if (params.status) q.set('status', params.status);
+      if (params.approved !== undefined) q.set('approved', String(params.approved));
+      if (params.source) q.set('source', params.source);
+      if (params.verification_status) q.set('verification_status', params.verification_status);
+      if (params.upcoming !== undefined) q.set('upcoming', String(params.upcoming));
+      if (params.q) q.set('q', params.q);
+    }
+    const qs = q.toString();
+    return authedFetch(`/api/camps${qs ? `?${qs}` : ''}`).then(handleResponse);
+  },
 
-  createCamp: (camp: Partial<Camp>): Promise<{ success: boolean }> =>
+  createCamp: (camp: Partial<Camp>): Promise<{ success: boolean; camp?: Camp }> =>
     authedFetch('/api/camps', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders(),
       body: JSON.stringify(camp),
     }).then(handleResponse),
 
-  updateCamp: (id: string, update: { approved?: boolean; registered?: number; status?: string }): Promise<{ success: boolean }> =>
+  updateCamp: (id: string, update: Partial<Camp>): Promise<{ success: boolean; camp?: Camp }> =>
     authedFetch(`/api/camps/${id}`, {
       method: 'PUT',
       headers: authHeaders(),
       body: JSON.stringify(update),
+    }).then(handleResponse),
+
+  deleteCamp: (id: string): Promise<{ success: boolean }> =>
+    authedFetch(`/api/camps/${id}`, {
+      method: 'DELETE',
+      headers: authHeaders(),
+    }).then(handleResponse),
+
+  cancelCamp: (id: string, reason?: string): Promise<{ success: boolean }> =>
+    authedFetch(`/api/camps/${id}/cancel`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({ reason }),
     }).then(handleResponse),
 
   verifyCamp: (id: string, verificationStatus: 'Verified' | 'Flagged' | 'Unverified', verifiedBy?: string): Promise<{ success: boolean }> =>

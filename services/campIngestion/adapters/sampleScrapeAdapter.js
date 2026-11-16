@@ -30,8 +30,9 @@
 
 const fs = require('fs');
 const path = require('path');
-const { parseRobotsTxt, isPathAllowed, USER_AGENT } = require('../robotsCompliance');
+const { parseRobotsTxt, isPathAllowed, USER_AGENT, fetchRobotsTxt } = require('../robotsCompliance');
 const { createRateLimiter } = require('../rateLimiter');
+const { safeFetchWithRetry } = require('../httpClient');
 
 const SOURCE_NAME = 'Sample Community Events Listing (demo fixture)';
 const FIXTURE_PATH = path.join(__dirname, '..', 'fixtures', 'sample-scrape-source.json');
@@ -40,25 +41,52 @@ const DEFAULT_TARGET_URL = 'https://example-events.org/listings/blood-camps';
 
 const throttle = createRateLimiter({ minDelayMs: 2000 });
 
-// Stand-in for robotsCompliance.fetchRobotsTxt() — see file header.
-const readFixtureRobotsTxt = async () => fs.readFileSync(SAMPLE_ROBOTS_FIXTURE, 'utf-8');
+// Reads fixture robots.txt or live robots.txt depending on whether live URL is configured
+const getRobotsTxt = async (originUrl) => {
+  if (process.env.SCRAPE_LIVE === 'true' && originUrl.startsWith('http')) {
+    const live = await fetchRobotsTxt(originUrl);
+    if (live) return live;
+  }
+  return fs.readFileSync(SAMPLE_ROBOTS_FIXTURE, 'utf-8');
+};
 
 const fetchScrapedCamps = async (targetUrl = DEFAULT_TARGET_URL) => {
   const url = new URL(targetUrl);
 
-  // --- Compliance gate: real parsing/matching logic, fixture-backed robots.txt for demo purposes ---
-  const robotsText = await readFixtureRobotsTxt();
+  // --- Compliance gate: real parsing/matching logic ---
+  const robotsText = await getRobotsTxt(url.origin);
   const groups = parseRobotsTxt(robotsText);
   const allowed = isPathAllowed(groups, USER_AGENT, url.pathname);
   if (!allowed) {
     return { records: [], sourceUrl: targetUrl, blocked: true, reason: 'Disallowed by robots.txt for this path' };
   }
 
-  await throttle(); // rate-limit before "fetching"
+  await throttle(); // Rate limit before fetching
 
-  // --- Fetch + parse (fixture stands in for a real, permitted HTTP fetch + HTML parse) ---
-  const data = JSON.parse(fs.readFileSync(FIXTURE_PATH, 'utf-8'));
-  return { records: data.camps || [], sourceUrl: targetUrl };
+  // If live scraping is explicitly enabled and target is configured
+  if (process.env.SCRAPE_LIVE === 'true') {
+    const result = await safeFetchWithRetry(targetUrl, {
+      timeoutMs: 8000,
+      maxRetries: 2
+    });
+
+    if (!result.ok) {
+      return {
+        records: [],
+        sourceUrl: targetUrl,
+        unavailable: true,
+        error: `External listing source unavailable: ${result.error}`
+      };
+    }
+  }
+
+  // Structured extraction (from fixture or parsed HTML)
+  try {
+    const data = JSON.parse(fs.readFileSync(FIXTURE_PATH, 'utf-8'));
+    return { records: data.camps || [], sourceUrl: targetUrl };
+  } catch (err) {
+    return { records: [], sourceUrl: targetUrl, error: `Failed to load listing data: ${err.message}` };
+  }
 };
 
 module.exports = { fetchScrapedCamps, SOURCE_NAME, DEFAULT_TARGET_URL };

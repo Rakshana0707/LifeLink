@@ -63,6 +63,11 @@ const runIngestion = async (db, opts) => {
       finishRun(db, runId, 'Failed', { fetched: 0, valid: 0, duplicate: 0, invalid: 0, inserted: 0 }, log, fetchResult.reason);
       return { runId, status: 'Failed', reason: fetchResult.reason, insertedCamps: [] };
     }
+    if (fetchResult.unavailable) {
+      log.push(`UNAVAILABLE: ${fetchResult.error}`);
+      finishRun(db, runId, 'Failed', { fetched: 0, valid: 0, duplicate: 0, invalid: 0, inserted: 0 }, log, fetchResult.error);
+      return { runId, status: 'Failed', reason: fetchResult.error, insertedCamps: [] };
+    }
     fetched = fetchResult.records || [];
     fetchedSourceUrl = fetchResult.sourceUrl || null;
     log.push(`Fetched ${fetched.length} raw record(s) from ${sourceName}.`);

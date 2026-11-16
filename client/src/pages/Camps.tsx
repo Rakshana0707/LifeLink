@@ -134,43 +134,34 @@ export const Camps: React.FC = () => {
   const handleConfirmCampRegistration = async () => {
     if (!registeringCamp || !selectedCampSlot) return;
 
-    const camp = registeringCamp;
-    const slotLimit = Math.max(1, Math.ceil(camp.limit / 4));
-    const count = usersList.filter(u => {
-      const reg = u.activeCampRegistration;
-      return reg && reg.campTitle === camp.title && reg.slot === selectedCampSlot;
-    }).length;
-
-    if (count >= slotLimit) {
-      showToast('warning', '⚠️ Slot Full', `Sorry, this time slot has reached its limit of ${slotLimit} donors.`);
+    if (!isLoggedIn || !user) {
+      showToast('warning', '🔒 Sign in required', 'Please sign in to register for a blood donation camp.');
       return;
     }
 
-    const verificationId = 'CAMP-REG-' + Math.floor(100000 + Math.random() * 900000);
-    const campRegistration = {
-      campTitle: camp.title,
-      verificationId: verificationId,
-      date: camp.date,
-      slot: selectedCampSlot
-    };
+    const camp = registeringCamp;
 
     try {
-      // 1. Update camp registration count
-      await api.updateCamp(camp.id, { registered: camp.registered + 1 });
-      
-      // 2. Save active registration to user profile if logged in
-      if (isLoggedIn && user) {
-        await api.updateUser(user.id, { activeCampRegistration: campRegistration });
-        await refreshUser();
-      }
+      const res = await api.registerForCamp(camp.id, user.id, selectedCampSlot);
+      if (res && res.verificationId) {
+        // Sync active registration locally on user profile
+        const campRegistration = {
+          campTitle: camp.title,
+          verificationId: res.verificationId,
+          date: camp.date,
+          slot: selectedCampSlot
+        };
+        await api.updateUser(user.id, { activeCampRegistration: campRegistration }).catch(() => {});
+        await refreshUser().catch(() => {});
 
-      showToast('success', '✅ Registered!', `You're registered for "${camp.title}".`);
-      showToast('info', '🪪 QR Pass Generated', `Show Pass ID ${verificationId} at the camp entrance.`);
-      
-      setRegisteringCamp(null);
-      fetchCamps();
+        showToast('success', '✅ Registered!', `You're registered for "${camp.title}".`);
+        showToast('info', '🪪 QR Pass Generated', `Show Pass ID ${res.verificationId} at the camp entrance.`);
+
+        setRegisteringCamp(null);
+        fetchCamps();
+      }
     } catch (err: any) {
-      showToast('warning', '⚠️ Error', err.message || 'Could not register for camp.');
+      showToast('warning', '⚠️ Registration failed', err.message || 'Could not register for camp.');
     }
   };
 
